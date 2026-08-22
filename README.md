@@ -46,21 +46,70 @@
 最後一項是 dead-man's switch：`monitor.py` 每次執行都會更新 `last_run`，`bot.py`
 每輪 `getUpdates` 回來時檢查。沒有它，「一切正常」和「監控自己死了」長得一模一樣。
 
-## Telegram 指令
+## Telegram 介面
+
+不用記指令：`/menu` 會給一組按鈕，而且 bot 啟動時會呼叫 `setMyCommands`，
+所以輸入框旁邊的指令選單也列得出來。
 
 ```
-/status         各 app 的過期倒數與錯誤
+/menu           功能選單（按鈕）
+/status         各 app 的到期倒數與問題
 /devices        各裝置連線狀態
 /log [n]        最近的異常紀錄（預設 15 筆）
 /stats [天數]   刷新/失敗次數與平均間隔（預設 7 天）
-/restart        重啟 daemon，需在 60 秒內傳 /confirm
+/restart        重啟 daemon（需確認）
 /mute [小時]    暫停主動通知（預設 8 小時）
 /unmute         解除靜音
 /help
 ```
 
+按鈕和文字指令走同一套 `dispatch()`，行為一致。重啟一定要二次確認——
+按鈕會跳出「確定重啟 / 取消」，文字指令則是 60 秒內回 `/confirm`。
+
 靜音只擋主動推送，指令回覆照常。靜音期間的事件**仍會寫進歷史**，解除後用
 `/log` 補看。
+
+## 報表排版
+
+報表包在 `<pre>` 裡送出，Telegram 才會用等寬字把欄位對齊；padding 用
+`display_width()` 計算，中文字算兩格，否則會歪。
+
+問題排在最前面，健康時就只有一行結論加表格：
+
+```
+🟢 一切正常
+
+6 個 app · 4 台裝置　最近刷新 3.7 小時前
+
+iPhone Air   18 分鐘前連線
+  YouTube    剩 6.8 天
+  Facebook   剩 6.8 天
+  Instagram  剩 6.8 天
+```
+
+有狀況時先給摘要，表格內對應的那幾行右側也會標記：
+
+```
+🔴 4 個問題
+
+🔴 已過期
+  iPad Air 4 - YouTube：已過期 2.0 天
+❌ 刷新失敗
+  iPhone Air - Instagram：anisette server unreachable（3 次）
+⚠ 逾期未刷新
+  iPhone Air - Facebook：剩 2.0 天
+📵 裝置離線
+  Joy：最後連線 3.0 天前
+
+...
+
+iPhone Air   19 分鐘前連線
+  Facebook   剩 2.0 天      ⚠
+  YouTube    剩 6.8 天
+  Instagram  剩 6.8 天      ❌
+```
+
+每台裝置內部依剩餘時間排序，快過期的自動浮到上面。
 
 ## 終端機用法
 

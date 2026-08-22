@@ -35,8 +35,24 @@ import common
 import history
 import monitor
 
-SENT: list[str] = []
-common.send_message = lambda text, chat_id=None: SENT.append(text)
+SENT: list[dict] = []
+
+
+def fake_api(method, **params):
+    """攔在最底層，send_message / send_report / answerCallbackQuery 都會經過。"""
+    SENT.append({"method": method, **params})
+    return {"ok": True}
+
+
+common.api = fake_api
+
+
+def sent_text() -> str:
+    return "\n\n".join(s.get("text", "") for s in SENT if s["method"] == "sendMessage")
+
+
+def sent_markups() -> list:
+    return [s.get("reply_markup") for s in SENT if s["method"] == "sendMessage"]
 
 
 def db(sql, *params):
@@ -56,7 +72,7 @@ def ts(**kw):
 def run(name) -> str:
     SENT.clear()
     monitor.main()
-    body = "\n\n".join(SENT)
+    body = sent_text()
     if VERBOSE:
         print(f"\n--- {name} ---\n{body or '(沒有推送)'}")
     return body
@@ -131,7 +147,7 @@ def set_last_run(**kw):
 set_last_run(hours=-9)
 SENT.clear()
 bot.check_heartbeat()
-check("偵測到 monitor 停擺", "停擺" in "\n".join(SENT))
+check("偵測到 monitor 停擺", "停擺" in sent_text())
 
 SENT.clear()
 bot.check_heartbeat()
@@ -140,7 +156,7 @@ check("冷卻期內不重複告警", not SENT)
 set_last_run(seconds=0)
 SENT.clear()
 bot.check_heartbeat()
-check("偵測到 monitor 恢復", "恢復" in "\n".join(SENT))
+check("偵測到 monitor 恢復", "恢復" in sent_text())
 
 # ------------------------------------------------------------------- 報表
 
@@ -154,7 +170,71 @@ for name, fn in (("/status", common.build_status_report),
         print(f"\n--- {name} ---\n{output}")
 
 # 超過 Telegram 上限要切段
-check("長訊息會切段", len(common._chunk("x\n" * 4000)) > 1)
+check("長訊息會切段", len(common._chunk("x\n" * 4000, 3400)) > 1)
+
+# 表格欄位要對齊：中文字寬度算 2 才不會歪
+check("寬度計算把中文算兩格", common.display_width("裝置ab") == 6)
+check("padding 依顯示寬度補齊", common.display_width(common.pad("裝置", 10)) == 10)
+
+
+# ------------------------------------------------------------- 選單與按鈕
+
+def press(action_or_data: str):
+    SENT.clear()
+    bot.handle_callback({
+        "id": "cb1",
+        "data": action_or_data,
+        "message": {"chat": {"id": int(config.CHAT_ID)}},
+    })
+
+
+def say(text: str):
+    SENT.clear()
+    bot.handle_message({
+        "chat": {"id": int(config.CHAT_ID)},
+        "text": text,
+    })
+
+
+common.perform_restart = lambda verify=True: (True, "已重啟（測試）")
+
+say("/menu")
+check("/menu 送出選單", "選單" in sent_text())
+check("選單帶按鈕", any(m and "inline_keyboard" in m for m in sent_markups()))
+
+press("status")
+check("按鈕 status 有回報表", "個 app" in sent_text())
+check("報表回覆也帶按鈕", any(m and "inline_keyboard" in m for m in sent_markups()))
+check("按鈕按下有 answerCallbackQuery",
+      any(s["method"] == "answerCallbackQuery" for s in SENT))
+
+press("restart")
+check("重啟先要確認", "確定要重啟" in sent_text())
+press("restart:go")
+check("確認後才真的重啟", "已重啟" in sent_text())
+
+press("restart:go")
+check("沒有待確認時拒絕重啟", "逾時" in sent_text())
+
+say("/restart")
+check("文字指令也走確認流程", "確定要重啟" in sent_text())
+say("/confirm")
+check("/confirm 仍可用", "已重啟" in sent_text())
+
+press("mute:8")
+check("按鈕可靜音", "已靜音 8 小時" in sent_text())
+press("unmute")
+check("按鈕可解除靜音", "已解除靜音" in sent_text())
+common.clear_mute()
+
+SENT.clear()
+bot.handle_message({"chat": {"id": 99999999}, "text": "/status"})
+check("非授權 chat 不回應", not SENT)
+
+say("/nonsense")
+check("未知指令回說明", "/menu" in sent_text())
+
+check("指令清單有註冊項目", len(bot.BOT_COMMANDS) >= 8)
 
 shutil.rmtree(TMP, ignore_errors=True)
 print("\n✅ 全部通過")

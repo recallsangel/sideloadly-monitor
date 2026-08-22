@@ -55,3 +55,5 @@ RESTART_VERIFY_INTERVAL_SECONDS = 2
 
 # Telegram 單則訊息上限 4096 字元，送出前依此切段。
 MESSAGE_CHUNK_LIMIT = 3900
+# 報表會再包一層 <pre> 並做 HTML escape，字數會膨脹，留多一點餘裕。
+REPORT_CHUNK_LIMIT = 3400
