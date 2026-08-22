@@ -1,5 +1,8 @@
 secrets.local.json
 state.json
+bot_offset.txt
+events.db
+mute_until.txt
 __pycache__/
 *.pyc
 *.log
