@@ -124,6 +124,39 @@ iPhone Air   19 分鐘前連線
 ./test_monitor.py -v  # 跑測試（-v 印出實際訊息內容）
 ```
 
+## 需求
+
+- macOS（要有 Sideloadly.app 及其 `installations.db`，排程也是用 launchd）
+- Python 3.9+，全部用標準庫，不用另外 `pip install`
+
+## 安裝與部署
+
+```sh
+git clone https://github.com/recallsangel/sideloadly-monitor.git
+cd sideloadly-monitor
+```
+
+1. 建立 Telegram bot（找 [@BotFather](https://t.me/BotFather) 拿 token），並取得要通知的
+   `chat_id`。
+2. 設定憑證，二選一：
+   - 環境變數 `SIDELOADLY_MONITOR_BOT_TOKEN`、`SIDELOADLY_MONITOR_CHAT_ID`
+   - 或在專案根目錄放 `secrets.local.json`（見下方「設定」，這個檔不會進版控）
+3. 把 `launchd/` 底下三個範本複製到 `~/Library/LaunchAgents/`，改掉裡面的
+   `com.example.*` label 和 `/path/to/sideloadly-monitor` 路徑，然後載入：
+
+   ```sh
+   cp launchd/*.plist ~/Library/LaunchAgents/
+   # 編輯剛複製的檔案，換成實際路徑與 label
+   launchctl load ~/Library/LaunchAgents/com.example.sideloadly-monitor.plist
+   launchctl load ~/Library/LaunchAgents/com.example.sideloadly-bot.plist
+   launchctl load ~/Library/LaunchAgents/com.example.sideloadly-daily-restart.plist
+   ```
+
+4. 傳 `/status` 給 bot 確認有回應。
+
+`restart.py` 預設用 `launchctl kickstart` 重啟 label 為 `io.sideloadly.daemon` 的
+Sideloadly daemon（`config.py` 的 `RESTART_LABEL`），如果你的環境 label 不同要一併改。
+
 ## 設定
 
 `config.py` 上方是設定值，敏感資料走環境變數或 `secrets.local.json`（不進版控）：
@@ -145,3 +178,7 @@ iPhone Air   19 分鐘前連線
 
 `test_monitor.py` 會把資料庫複製到暫存目錄後改資料來製造各種狀況，並換掉
 `send_message`，所以不會動到真實狀態、也不會發訊息。
+
+## 授權
+
+[MIT License](LICENSE)
