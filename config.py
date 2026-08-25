@@ -19,8 +19,7 @@ def _secret(env_name: str, json_key: str) -> str:
     )
 
 
-# Bot 沿用 Docker/alisha 專案的 alishatw_bot，chat_id 是 @REDACTED 的 telegram_user_id
-# （從 Docker/alisha/data/alisha.db 的 orders 表查到）。實際值放在 secrets.local.json，
+# chat_id 是要接收通知的使用者的 telegram_user_id。實際值放在 secrets.local.json，
 # 不進版控（這個 repo 會 push 到 GitHub）。
 BOT_TOKEN = _secret("SIDELOADLY_MONITOR_BOT_TOKEN", "bot_token")
 CHAT_ID = _secret("SIDELOADLY_MONITOR_CHAT_ID", "chat_id")

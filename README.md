@@ -81,10 +81,10 @@
 
 6 個 app · 4 台裝置　最近刷新 3.7 小時前
 
-iPhone Air   18 分鐘前連線
-  YouTube    剩 6.8 天
-  Facebook   剩 6.8 天
-  Instagram  剩 6.8 天
+裝置 A   18 分鐘前連線
+  App 1  剩 6.8 天
+  App 2  剩 6.8 天
+  App 3  剩 6.8 天
 ```
 
 有狀況時先給摘要，表格內對應的那幾行右側也會標記：
@@ -93,20 +93,20 @@ iPhone Air   18 分鐘前連線
 🔴 4 個問題
 
 🔴 已過期
-  iPad Air 4 - YouTube：已過期 2.0 天
+  裝置 B - App 1：已過期 2.0 天
 ❌ 刷新失敗
-  iPhone Air - Instagram：anisette server unreachable（3 次）
+  裝置 A - App 3：anisette server unreachable（3 次）
 ⚠ 逾期未刷新
-  iPhone Air - Facebook：剩 2.0 天
+  裝置 A - App 2：剩 2.0 天
 📵 裝置離線
-  Joy：最後連線 3.0 天前
+  裝置 C：最後連線 3.0 天前
 
 ...
 
-iPhone Air   19 分鐘前連線
-  Facebook   剩 2.0 天      ⚠
-  YouTube    剩 6.8 天
-  Instagram  剩 6.8 天      ❌
+裝置 A   19 分鐘前連線
+  App 2  剩 2.0 天      ⚠
+  App 1  剩 6.8 天
+  App 3  剩 6.8 天      ❌
 ```
 
 每台裝置內部依剩餘時間排序，快過期的自動浮到上面。
