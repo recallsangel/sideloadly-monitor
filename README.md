@@ -20,7 +20,8 @@
 
 另外會讀 `account-appids.json`（同目錄，Sideloadly 自己維護，一樣唯讀），
 記著每個已登入 Apple ID 本週還剩多少 App ID 額度——免費帳號一週只能註冊 10 個，
-額度用完是「這個 Apple ID 發的憑證出問題」最常見的原因之一。
+額度用完是「這個 Apple ID 發的憑證出問題」最常見的原因之一。隨時可以用
+`/accounts` 查目前每個帳號的額度，不用等刷新失敗才知道。
 
 ## 過期判定
 
@@ -64,6 +65,7 @@
 /menu           功能選單（按鈕）
 /status         各 app 的到期倒數與問題
 /devices        各裝置連線狀態
+/accounts       各 Apple ID 本週 App ID 額度
 /log [n]        最近的異常紀錄（預設 15 筆）
 /stats [天數]   刷新/失敗次數與平均間隔（預設 7 天）
 /restart        重啟 daemon（需確認）

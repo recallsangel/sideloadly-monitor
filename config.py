@@ -28,6 +28,10 @@ SIDELOADLY_DB_PATH = Path.home() / "Library/Application Support/sideloadly/insta
 # 各已登入 Apple ID 本週還剩多少 App ID 額度（免費帳號一週 10 個）。
 # sideloadly 自己維護，不是這個專案寫的。
 ACCOUNT_APPIDS_PATH = Path.home() / "Library/Application Support/sideloadly/account-appids.json"
+# 免費 Apple 開發者帳號的每週 App ID 額度上限，只用來在報表裡顯示「剩 X / 10」。
+WEEKLY_APPID_QUOTA = 10
+# /accounts 報表裡用來標記「快用完」的門檻（含）。
+LOW_QUOTA_THRESHOLD = 2
 STATE_PATH = PROJECT_DIR / "state.json"
 BOT_OFFSET_PATH = PROJECT_DIR / "bot_offset.txt"
 EVENTS_DB_PATH = PROJECT_DIR / "events.db"

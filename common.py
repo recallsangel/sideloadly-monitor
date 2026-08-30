@@ -510,6 +510,46 @@ def build_device_report() -> str:
     return "\n".join(lines)
 
 
+def build_account_report() -> str:
+    quotas = fetch_account_quotas()
+    if not quotas:
+        return "讀不到帳號額度資料（account-appids.json 不存在或格式看不懂）。"
+
+    accounts = sorted(quotas.values(), key=lambda q: q.remaining)
+    low = [q for q in accounts if q.remaining <= config.LOW_QUOTA_THRESHOLD]
+
+    lines = [
+        f"⚠ {len(low)} 個帳號額度偏低 / 共 {len(accounts)} 個"
+        if low
+        else f"🟢 {len(accounts)} 個帳號額度都還夠用",
+        "",
+    ]
+
+    name_width = 2 + max(display_width(q.apple_id) for q in accounts)
+    now = datetime.now(timezone.utc)
+    for q in accounts:
+        row = pad(q.apple_id, name_width) + f"剩 {q.remaining} / {config.WEEKLY_APPID_QUOTA}"
+        if q.remaining <= 0:
+            row += "  ❌"
+        elif q.remaining <= config.LOW_QUOTA_THRESHOLD:
+            row += "  ⚠"
+        lines.append(row)
+
+        if q.nearest_ttl is None:
+            reset_text = "無資料"
+        elif q.nearest_ttl <= now:
+            reset_text = "應已釋放（下次使用時更新）"
+        else:
+            reset_text = f"{human_delta((q.nearest_ttl - now).total_seconds())}後"
+        lines.append(f"  {' ' * name_width}下一個額度釋放：{reset_text}")
+
+    lines.append("")
+    lines.append("額度是這週能再註冊幾個 App ID，不是帳號本身壞了。")
+    lines.append("重簽會不會用到新 App ID 沒有公開規則，額度用完時保守起見")
+    lines.append("換去還有額度的帳號比較保險。")
+    return "\n".join(lines).rstrip()
+
+
 # ---------------------------------------------------------------- daemon
 
 def daemon_state() -> str | None:

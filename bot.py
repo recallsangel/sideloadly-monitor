@@ -20,6 +20,7 @@ BOT_COMMANDS = [
     {"command": "menu", "description": "功能選單"},
     {"command": "status", "description": "各 app 到期倒數"},
     {"command": "devices", "description": "裝置連線狀態"},
+    {"command": "accounts", "description": "Apple ID 額度狀態"},
     {"command": "log", "description": "最近異常紀錄"},
     {"command": "stats", "description": "刷新統計"},
     {"command": "restart", "description": "重啟 Sideloadly daemon"},
@@ -33,6 +34,9 @@ MENU_KEYBOARD = {
         [
             {"text": "📊 狀態", "callback_data": "status"},
             {"text": "📱 裝置", "callback_data": "devices"},
+        ],
+        [
+            {"text": "🆔 Apple ID 額度", "callback_data": "accounts"},
         ],
         [
             {"text": "📜 異常紀錄", "callback_data": "log"},
@@ -65,6 +69,7 @@ HELP_TEXT = (
     "/menu - 功能選單（按鈕）\n"
     "/status - 各 app 到期倒數與問題\n"
     "/devices - 裝置連線狀態\n"
+    "/accounts - 各 Apple ID 本週 App ID 額度\n"
     "/log [n] - 最近異常紀錄（預設 15 筆）\n"
     "/stats [天數] - 刷新統計與平均間隔（預設 7 天）\n"
     "/restart - 重啟 daemon（需確認）\n"
@@ -123,6 +128,9 @@ def dispatch(action: str, args: list[str]):
 
     elif action == "devices":
         common.send_report(common.build_device_report(), reply_markup=MENU_KEYBOARD)
+
+    elif action == "accounts":
+        common.send_report(common.build_account_report(), reply_markup=MENU_KEYBOARD)
 
     elif action == "log":
         common.send_report(
