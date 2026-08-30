@@ -50,6 +50,7 @@ def main():
 
     installs = common.fetch_installs()
     devices = common.fetch_devices()
+    quotas = common.fetch_account_quotas()
 
     refreshed, failed, recovered, overdue, expired = [], [], [], [], []
     offline, back_online = [], []
@@ -75,6 +76,22 @@ def main():
                 f"(failures={inst.failures_count})"
             )
             history.record("failure", inst.device_name, inst.app_name, inst.last_error)
+
+            # apple_id 額度用完是常見的假期到——見不到明確錯誤訊息分類，
+            # 只能拿 App ID 週配額當旁證，附一個「可以換這個帳號試試」的提示。
+            current_quota = quotas.get(inst.apple_id) if inst.apple_id else None
+            if inst.apple_id and current_quota is not None and current_quota.remaining <= 0:
+                alt = common.suggest_alternate_account(inst.apple_id, quotas)
+                if alt:
+                    failed.append(
+                        f"    ↳ {inst.apple_id} 本週 App ID 額度已用完，"
+                        f"可試著切到 {alt.apple_id}（剩 {alt.remaining} 個）"
+                    )
+                else:
+                    failed.append(
+                        f"    ↳ {inst.apple_id} 本週 App ID 額度已用完，"
+                        f"其他已綁定帳號也沒有剩餘額度"
+                    )
         elif prev and (prev_error or prev_failures) and not inst.failing:
             recovered.append(f"  · {inst.label}")
             history.record("recovery", inst.device_name, inst.app_name)

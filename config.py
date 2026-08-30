@@ -25,6 +25,9 @@ BOT_TOKEN = _secret("SIDELOADLY_MONITOR_BOT_TOKEN", "bot_token")
 CHAT_ID = _secret("SIDELOADLY_MONITOR_CHAT_ID", "chat_id")
 
 SIDELOADLY_DB_PATH = Path.home() / "Library/Application Support/sideloadly/installations.db"
+# 各已登入 Apple ID 本週還剩多少 App ID 額度（免費帳號一週 10 個）。
+# sideloadly 自己維護，不是這個專案寫的。
+ACCOUNT_APPIDS_PATH = Path.home() / "Library/Application Support/sideloadly/account-appids.json"
 STATE_PATH = PROJECT_DIR / "state.json"
 BOT_OFFSET_PATH = PROJECT_DIR / "bot_offset.txt"
 EVENTS_DB_PATH = PROJECT_DIR / "events.db"

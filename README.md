@@ -18,6 +18,10 @@
 資料來源是 Sideloadly 自己的 sqlite（**唯讀開啟**，不寫入）：
 `~/Library/Application Support/sideloadly/installations.db`
 
+另外會讀 `account-appids.json`（同目錄，Sideloadly 自己維護，一樣唯讀），
+記著每個已登入 Apple ID 本週還剩多少 App ID 額度——免費帳號一週只能註冊 10 個，
+額度用完是「這個 Apple ID 發的憑證出問題」最常見的原因之一。
+
 ## 過期判定
 
 不用寫死的天數，直接讀資料庫裡 Sideloadly 自己的設定：
@@ -42,6 +46,11 @@
 | 監控停擺 | `state.json` 的 `last_run` 超過 `HEARTBEAT_STALE_HOURS` 沒更新 |
 
 同一輪的變化會**併成一則訊息**，不會每個 app 各發一次。
+
+「刷新失敗」如果剛好碰上失敗那個 app 綁定的 Apple ID 本週 App ID 額度是 0，
+訊息會多一行提示，建議切去哪個還有額度的已綁定帳號（額度取自 `account-appids.json`，
+挑剩最多的那個）。**這只是提示，不是診斷**——Sideloadly 沒公開失敗原因分類，
+額度用完只是眾多可能原因之一，需要的話還是手動去 Sideloadly 換帳號重簽。
 
 最後一項是 dead-man's switch：`monitor.py` 每次執行都會更新 `last_run`，`bot.py`
 每輪 `getUpdates` 回來時檢查。沒有它，「一切正常」和「監控自己死了」長得一模一樣。

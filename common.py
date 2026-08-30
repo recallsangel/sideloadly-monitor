@@ -184,6 +184,7 @@ class Install:
     device_name: str
     app_name: str
     version: str | None
+    apple_id: str | None
     last_updated: datetime | None
     expires_at: datetime | None
     refresh_due_at: datetime | None
@@ -275,6 +276,7 @@ def _to_install(row: sqlite3.Row) -> Install:
         device_name=row["device_name"] or row["device_udid"],
         app_name=row["app_name"],
         version=row["version"],
+        apple_id=row["apple_id"] or None,
         last_updated=last_updated,
         expires_at=last_updated + timedelta(days=ttl_days) if last_updated else None,
         refresh_due_at=last_updated + timedelta(hours=refresh_hours) if last_updated else None,
@@ -290,7 +292,7 @@ def fetch_installs() -> list[Install]:
         rows = con.execute(
             """
             SELECT i.id, i.device_udid, d.name AS device_name, i.name AS app_name,
-                   i.version, i.last_updated, i.known_ttl, i.refresh_at_hours,
+                   i.version, i.apple_id, i.last_updated, i.known_ttl, i.refresh_at_hours,
                    i.last_error, i.failures_count, i.last_failure_at
             FROM installations i
             LEFT JOIN devices d ON d.udid = i.device_udid
@@ -322,6 +324,53 @@ def fetch_devices() -> list[Device]:
         )
         for row in rows
     ]
+
+
+@dataclass
+class AccountQuota:
+    apple_id: str
+    remaining: int
+    nearest_ttl: datetime | None
+
+
+def fetch_account_quotas() -> dict[str, AccountQuota]:
+    """讀 sideloadly 自己維護的 account-appids.json，key 是 apple_id。
+
+    這個檔案跟 installations.db 一樣是 sideloadly 的內部狀態、沒有公開格式，
+    所以任何欄位缺漏或格式不對都當作「讀不到」處理，不讓這個輔助功能弄壞主流程。
+    """
+    if not config.ACCOUNT_APPIDS_PATH.exists():
+        return {}
+    try:
+        raw = json.loads(config.ACCOUNT_APPIDS_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    quotas = {}
+    for apple_id, info in raw.items():
+        if not isinstance(info, dict) or "Remaining" not in info:
+            continue
+        quotas[apple_id] = AccountQuota(
+            apple_id=apple_id,
+            remaining=info.get("Remaining", 0),
+            nearest_ttl=parse_ts(info.get("NearestTtl")),
+        )
+    return quotas
+
+
+def suggest_alternate_account(
+    current_apple_id: str | None, quotas: dict[str, AccountQuota]
+) -> AccountQuota | None:
+    """目前這個帳號額度用完時，挑一個額度還沒用完、剩最多的其他已綁定帳號。
+
+    只挑本地資料看得到的線索（App ID 週配額），不代表一定能解決那次失敗——
+    Sideloadly 沒公開失敗原因的分類，這只是提示，不是診斷。
+    """
+    candidates = [
+        q for aid, q in quotas.items() if aid != current_apple_id and q.remaining > 0
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda q: q.remaining)
 
 
 # ------------------------------------------------------------------- 報表
