@@ -17,7 +17,9 @@ def restart_reasons() -> list[str]:
     if state != "running":
         reasons.append(f"daemon 不在執行中（state={state}）")
 
-    for inst in common.fetch_installs():
+    # visible_installs()，不是 fetch_installs()：一個被 /forget 忘記的裝置/app
+    # 不該再逼著每天 4am 的自動重啟去處理它。
+    for inst in common.visible_installs():
         if inst.expired:
             reasons.append(f"{inst.label} {inst.expiry_text()}")
         elif inst.overdue:

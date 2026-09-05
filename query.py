@@ -13,6 +13,7 @@ REPORTS = {
     "devices": common.build_device_report,
     "log": history.build_log_report,
     "stats": history.build_stats_report,
+    "forgotten": common.build_ignored_report,
     "daemon": lambda: f"daemon state = {common.daemon_state()}",
 }
 

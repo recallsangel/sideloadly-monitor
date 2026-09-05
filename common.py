@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 import config
+import ignore
 
 _TS_RE = re.compile(r"^(?P<base>.*)\.(?P<frac>\d+)(?P<tz>[+-]\d{2}:\d{2})?$")
 _STATE_RE = re.compile(r"^\s*state = (\S+)", re.MULTILINE)
@@ -326,6 +327,23 @@ def fetch_devices() -> list[Device]:
     ]
 
 
+def visible_installs() -> list[Install]:
+    """套用本地 /forget 清單。報表和 monitor/restart 的判斷一律要用這個，
+    不要直接用 fetch_installs()，否則忘記的裝置/app 還是會觸發告警或自動重啟。"""
+    ignored_devices, ignored_installs = ignore.ignored_keys()
+    return [
+        i
+        for i in fetch_installs()
+        if i.device_udid not in ignored_devices
+        and (i.device_udid, i.app_name) not in ignored_installs
+    ]
+
+
+def visible_devices() -> list[Device]:
+    ignored_devices, _ = ignore.ignored_keys()
+    return [d for d in fetch_devices() if d.udid not in ignored_devices]
+
+
 @dataclass
 class AccountQuota:
     apple_id: str
@@ -380,11 +398,11 @@ SEVERITY_ORDER = ["🔴 已過期", "❌ 刷新失敗", "⚠ 逾期未刷新", "
 
 
 def build_status_report() -> str:
-    installs = fetch_installs()
+    installs = visible_installs()
     if not installs:
         return "沒有任何裝置資料。"
 
-    devices = {d.udid: d for d in fetch_devices()}
+    devices = {d.udid: d for d in visible_devices()}
     by_device: dict[str, list[Install]] = {}
     for inst in installs:
         by_device.setdefault(inst.device_udid, []).append(inst)
@@ -483,8 +501,40 @@ def build_status_report() -> str:
     return "\n".join(lines).rstrip()
 
 
+def status_action_keyboard() -> dict | None:
+    """有問題的 app 各配一顆按鈕，一鍵發動重新部署——動作其實是重啟整個
+    daemon（見 bot.py 的 redeploy 說明），這裡只負責點名是哪個 app 促成的。"""
+    problems = [i for i in visible_installs() if i.expired or i.overdue or i.failing]
+    if not problems:
+        return None
+    return {
+        "inline_keyboard": [
+            [{"text": f"🔁 {p.label}", "callback_data": f"redeploy:{p.id}"}]
+            for p in problems[: config.PICKER_MAX_BUTTONS]
+        ]
+    }
+
+
+def build_ignored_report() -> str:
+    devices = ignore.list_ignored_devices()
+    installs = ignore.list_ignored_installs()
+    if not devices and not installs:
+        return "目前沒有忘記任何裝置或 app。"
+
+    lines = [f"🙈 已忘記 {len(devices)} 台裝置、{len(installs)} 個 app："]
+    if devices:
+        lines.append("")
+        lines.append("裝置（整台都不再告警）：")
+        lines.extend(f"  · {d.name}" for d in devices)
+    if installs:
+        lines.append("")
+        lines.append("app：")
+        lines.extend(f"  · {i.device_name} - {i.app_name}" for i in installs)
+    return "\n".join(lines)
+
+
 def build_device_report() -> str:
-    devices = fetch_devices()
+    devices = visible_devices()
     if not devices:
         return "沒有任何裝置資料。"
 

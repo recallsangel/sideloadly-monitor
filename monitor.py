@@ -48,8 +48,9 @@ def main():
     first_run = not state["installations"]
     today = datetime.now(timezone.utc).date().isoformat()
 
-    installs = common.fetch_installs()
-    devices = common.fetch_devices()
+    # 用 visible_* 而不是 fetch_*：被 /forget 忘記的裝置/app 不該再觸發告警。
+    installs = common.visible_installs()
+    devices = common.visible_devices()
     quotas = common.fetch_account_quotas()
 
     refreshed, failed, recovered, overdue, expired = [], [], [], [], []

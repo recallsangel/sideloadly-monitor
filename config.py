@@ -36,6 +36,9 @@ STATE_PATH = PROJECT_DIR / "state.json"
 BOT_OFFSET_PATH = PROJECT_DIR / "bot_offset.txt"
 EVENTS_DB_PATH = PROJECT_DIR / "events.db"
 MUTE_PATH = PROJECT_DIR / "mute_until.txt"
+# /forget 忘記的裝置/app 清單，見 ignore.py。跟 installations.db 無關，純粹是本專案
+# 自己的「不想再看到」名單，過濾發生在讀出來之後那一層。
+IGNORED_PATH = PROJECT_DIR / "ignored.json"
 RESTART_LABEL = "io.sideloadly.daemon"
 
 # 過期判定改用 installations 表的 known_ttl（憑證有效天數）與 refresh_at_hours
@@ -58,6 +61,10 @@ HEARTBEAT_REPEAT_HOURS = 6
 # perform_restart() 送出 kickstart 後，隔多久確認一次 daemon 有沒有回到 running。
 RESTART_VERIFY_ATTEMPTS = 5
 RESTART_VERIFY_INTERVAL_SECONDS = 2
+
+# /forget、/forgotten、/redeploy 的選單訊息最多列幾顆按鈕，避免裝置/app 一多
+# 整則訊息炸開（Telegram 單則訊息的按鈕數也有上限）。
+PICKER_MAX_BUTTONS = 20
 
 # Telegram 單則訊息上限 4096 字元，送出前依此切段。
 MESSAGE_CHUNK_LIMIT = 3900

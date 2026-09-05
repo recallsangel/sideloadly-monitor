@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 import common
 import config
 import history
+import ignore
 
 # 註冊給 Telegram，聊天室輸入框旁就會出現指令選單。
 BOT_COMMANDS = [
@@ -24,6 +25,9 @@ BOT_COMMANDS = [
     {"command": "log", "description": "最近異常紀錄"},
     {"command": "stats", "description": "刷新統計"},
     {"command": "restart", "description": "重啟 Sideloadly daemon"},
+    {"command": "redeploy", "description": "為某個 app 重新部署（重啟 daemon）"},
+    {"command": "forget", "description": "忘記某個裝置或 app"},
+    {"command": "forgotten", "description": "查看/復原忘記清單"},
     {"command": "mute", "description": "暫停通知（預設 8 小時）"},
     {"command": "unmute", "description": "解除靜音"},
     {"command": "help", "description": "說明"},
@@ -46,7 +50,14 @@ MENU_KEYBOARD = {
             {"text": "🔇 靜音 8 小時", "callback_data": "mute:8"},
             {"text": "🔔 解除靜音", "callback_data": "unmute"},
         ],
-        [{"text": "🔄 重啟 daemon", "callback_data": "restart"}],
+        [
+            {"text": "🙈 忘記裝置/app", "callback_data": "forget"},
+            {"text": "🔔 忘記清單", "callback_data": "forgotten"},
+        ],
+        [
+            {"text": "🔄 重啟 daemon", "callback_data": "restart"},
+            {"text": "🔁 重新部署", "callback_data": "redeploy"},
+        ],
     ]
 }
 
@@ -58,6 +69,10 @@ CONFIRM_KEYBOARD = {
         ]
     ]
 }
+
+# 選單清單類訊息（/forget /forgotten /redeploy 的選項列表）按鈕下方統一加這顆，
+# 不整包附上 MENU_KEYBOARD——選項本來就可能有一大串，再疊六顆選單按鈕只會更亂。
+BACK_TO_MENU_KEYBOARD_ROW = [{"text": "◀️ 選單", "callback_data": "menu"}]
 
 MENU_TEXT = (
     "Sideloadly 監控選單\n"
@@ -73,6 +88,11 @@ HELP_TEXT = (
     "/log [n] - 最近異常紀錄（預設 15 筆）\n"
     "/stats [天數] - 刷新統計與平均間隔（預設 7 天）\n"
     "/restart - 重啟 daemon（需確認）\n"
+    "/redeploy - 為某個 app 重新部署（需確認；動作跟 /restart 一樣是整顆"
+    "daemon 重啟，只是訊息和紀錄會點名是為了哪個 app）\n"
+    "/forget - 忘記某個裝置或 app，之後不再收到它的告警（只是本機清單，"
+    "不會動到 Sideloadly 自己的資料）\n"
+    "/forgotten - 查看已忘記清單，可以復原\n"
     "/mute [小時] - 暫停主動通知（預設 8 小時）\n"
     "/unmute - 解除靜音\n\n"
     "過期倒數是依資料庫的憑證有效天數算的。\n"
@@ -82,9 +102,68 @@ HELP_TEXT = (
 CONFIRM_WINDOW = timedelta(seconds=60)
 DEFAULT_MUTE_HOURS = 8
 
-_pending_restart: datetime | None = None
+# {"until": datetime, "reason": str | None} — reason 是 /redeploy 點名的 app，
+# 一般 /restart 沒有 reason。兩者共用同一段確認流程與同一個 restart:go 按鈕。
+_pending_restart: dict | None = None
 _heartbeat_alerted_at: datetime | None = None
 _heartbeat_was_stale = False
+
+# /forget、/forgotten 選單的「按鈕代號 → 動作」對照表，選單訊息送出時重建，
+# 只在下一次按鈕按下之前有效（跟 _pending_restart 一樣是進程內的暫存狀態，
+# 這個 bot 本來就是單一 chat 常駐一個進程，不需要更持久的存法）。
+# value 是 (kind, ignore_or_unignore 的位置參數 tuple, 顯示用的名字)。
+_forget_candidates: dict[str, tuple[str, tuple, str]] = {}
+_unforget_candidates: dict[str, tuple[str, tuple, str]] = {}
+
+
+def _forget_options() -> list[tuple[str, tuple, str]]:
+    """目前還沒被忘記、可以拿去問「要不要忘記」的裝置與 app。"""
+    options = []
+    for d in common.fetch_devices():
+        if not ignore.is_device_ignored(d.udid):
+            options.append(("device", (d.udid, d.name), d.name))
+    for i in common.fetch_installs():
+        if not ignore.is_install_ignored(i.device_udid, i.app_name):
+            options.append(("install", (i.device_udid, i.device_name, i.app_name), i.label))
+    return options
+
+
+def _unforget_options() -> list[tuple[str, tuple, str]]:
+    """目前已經忘記、可以拿去問「要不要復原」的裝置與 app。"""
+    options = [
+        ("device", (d.udid,), d.name) for d in ignore.list_ignored_devices()
+    ]
+    options += [
+        ("install", (i.device_udid, i.app_name), f"{i.device_name} - {i.app_name}")
+        for i in ignore.list_ignored_installs()
+    ]
+    return options
+
+
+def _picker_keyboard(rows: list[list[dict]]) -> dict:
+    return {"inline_keyboard": rows + [BACK_TO_MENU_KEYBOARD_ROW]}
+
+
+def _start_redeploy_confirm(reason: str | None):
+    """/restart 與 /redeploy 共用的確認流程，差別只在訊息措辭跟事後紀錄要不要
+    點名是哪個 app——實際動作兩邊完全一樣，都是整顆 daemon 重啟。"""
+    global _pending_restart
+    _pending_restart = {
+        "until": datetime.now(timezone.utc) + CONFIRM_WINDOW,
+        "reason": reason,
+    }
+    if reason:
+        text = (
+            f"⚠ 確定要為了「{reason}」重新部署？\n"
+            "這個動作是重啟整顆 Sideloadly daemon（目前沒有辦法只重簽單一 app），"
+            "其他裝置／app 正在進行的刷新也會被一起打斷。60 秒內確認，或直接忽略。"
+        )
+    else:
+        text = (
+            "⚠ 確定要重啟 Sideloadly daemon？\n"
+            "正在進行的刷新會被打斷。60 秒內確認，或直接忽略。"
+        )
+    common.send_message(text, reply_markup=CONFIRM_KEYBOARD)
 
 
 def load_offset() -> int:
@@ -118,13 +197,19 @@ def _int_arg(args: list[str], default: int, lo: int, hi: int) -> int:
 
 def dispatch(action: str, args: list[str]):
     """文字指令和按鈕共用同一套動作。"""
-    global _pending_restart
+    global _pending_restart, _forget_candidates, _unforget_candidates
 
     if action == "menu":
         common.send_message(MENU_TEXT, reply_markup=MENU_KEYBOARD)
 
     elif action == "status":
-        common.send_report(common.build_status_report(), reply_markup=MENU_KEYBOARD)
+        problem_keyboard = common.status_action_keyboard()
+        markup = (
+            {"inline_keyboard": problem_keyboard["inline_keyboard"] + MENU_KEYBOARD["inline_keyboard"]}
+            if problem_keyboard
+            else MENU_KEYBOARD
+        )
+        common.send_report(common.build_status_report(), reply_markup=markup)
 
     elif action == "devices":
         common.send_report(common.build_device_report(), reply_markup=MENU_KEYBOARD)
@@ -145,24 +230,105 @@ def dispatch(action: str, args: list[str]):
         )
 
     elif action == "restart":
-        _pending_restart = datetime.now(timezone.utc) + CONFIRM_WINDOW
-        common.send_message(
-            "⚠ 確定要重啟 Sideloadly daemon？\n"
-            "正在進行的刷新會被打斷。60 秒內確認，或直接忽略。",
-            reply_markup=CONFIRM_KEYBOARD,
-        )
+        _start_redeploy_confirm(None)
 
     elif action == "restart:go":
-        if _pending_restart is None or datetime.now(timezone.utc) > _pending_restart:
+        if _pending_restart is None or datetime.now(timezone.utc) > _pending_restart["until"]:
             _pending_restart = None
             common.send_message("確認已逾時，請重新操作。", reply_markup=MENU_KEYBOARD)
             return
+        reason = _pending_restart.get("reason")
         _pending_restart = None
         common.send_message("正在重啟，稍候…")
         ok, result = common.perform_restart()
-        history.record("restart", detail=f"telegram: {result}")
+        detail = f"telegram(為了 {reason}): {result}" if reason else f"telegram: {result}"
+        history.record("restart", detail=detail)
         common.send_message(
             ("✅ " if ok else "❌ ") + result, reply_markup=MENU_KEYBOARD
+        )
+
+    elif action == "redeploy":
+        target = args[0] if args else None
+        if not target:
+            installs = common.fetch_installs()
+            if not installs:
+                common.send_message(
+                    "沒有任何裝置資料，沒有東西可以重新部署。", reply_markup=MENU_KEYBOARD
+                )
+                return
+            rows = [
+                [{"text": i.label, "callback_data": f"redeploy:{i.id}"}]
+                for i in installs[: config.PICKER_MAX_BUTTONS]
+            ]
+            common.send_message(
+                "選一個 app：實際動作是重啟整顆 daemon，這裡只是讓訊息和紀錄"
+                "點名是為了哪個 app。",
+                reply_markup=_picker_keyboard(rows),
+            )
+            return
+        match = next((i for i in common.fetch_installs() if i.id == target), None)
+        if match is None:
+            common.send_message(
+                "找不到這個 app 了，可能已經被刪除或重簽過。", reply_markup=MENU_KEYBOARD
+            )
+            return
+        _start_redeploy_confirm(match.label)
+
+    elif action == "forget":
+        if args and args[0] in _forget_candidates:
+            kind, fargs, label = _forget_candidates.pop(args[0])
+            added = ignore.ignore_device(*fargs) if kind == "device" else ignore.ignore_install(*fargs)
+            text = (
+                f"🙈 已忘記「{label}」，之後不會再收到它的告警。"
+                if added
+                else f"「{label}」本來就已經忘記了。"
+            )
+            common.send_message(text + "\n可用 /forgotten 查看或復原。", reply_markup=MENU_KEYBOARD)
+            return
+
+        options = _forget_options()[: config.PICKER_MAX_BUTTONS]
+        _forget_candidates = {}
+        if not options:
+            common.send_message("目前沒有可以忘記的裝置或 app 了。", reply_markup=MENU_KEYBOARD)
+            return
+        rows = []
+        for idx, (kind, fargs, label) in enumerate(options, start=1):
+            key = str(idx)
+            _forget_candidates[key] = (kind, fargs, label)
+            rows.append([{"text": label, "callback_data": f"forget:{key}"}])
+        common.send_message(
+            "選一個要忘記的裝置或 app（忘記後不會再看到它的告警，可用 "
+            "/forgotten 復原）：",
+            reply_markup=_picker_keyboard(rows),
+        )
+
+    elif action == "forgotten":
+        if args and args[0] in _unforget_candidates:
+            kind, fargs, label = _unforget_candidates.pop(args[0])
+            removed = (
+                ignore.unignore_device(*fargs) if kind == "device" else ignore.unignore_install(*fargs)
+            )
+            text = (
+                f"🔔 已取消忘記「{label}」，之後會恢復告警。"
+                if removed
+                else f"「{label}」不在忘記清單裡（可能已經復原過了）。"
+            )
+            common.send_message(text, reply_markup=MENU_KEYBOARD)
+            return
+
+        options = _unforget_options()[: config.PICKER_MAX_BUTTONS]
+        _unforget_candidates = {}
+        report = common.build_ignored_report()
+        if not options:
+            common.send_message(report, reply_markup=MENU_KEYBOARD)
+            return
+        rows = []
+        for idx, (kind, fargs, label) in enumerate(options, start=1):
+            key = str(idx)
+            _unforget_candidates[key] = (kind, fargs, label)
+            rows.append([{"text": f"🔔 {label}", "callback_data": f"forgotten:{key}"}])
+        common.send_message(
+            report + "\n\n點按鈕可以取消忘記：", reply_markup=_picker_keyboard(rows)
         )
 
     elif action == "mute":

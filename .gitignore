@@ -3,6 +3,7 @@ state.json
 bot_offset.txt
 events.db
 mute_until.txt
+ignored.json
 __pycache__/
 *.pyc
 *.log

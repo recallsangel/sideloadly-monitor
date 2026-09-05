@@ -69,16 +69,50 @@
 /log [n]        最近的異常紀錄（預設 15 筆）
 /stats [天數]   刷新/失敗次數與平均間隔（預設 7 天）
 /restart        重啟 daemon（需確認）
+/redeploy       為某個 app 重新部署（需確認；動作跟 /restart 一樣）
+/forget         忘記某個裝置或 app，之後不再告警
+/forgotten      查看忘記清單，可以復原
 /mute [小時]    暫停主動通知（預設 8 小時）
 /unmute         解除靜音
 /help
 ```
 
 按鈕和文字指令走同一套 `dispatch()`，行為一致。重啟一定要二次確認——
-按鈕會跳出「確定重啟 / 取消」，文字指令則是 60 秒內回 `/confirm`。
+按鈕會跳出「確定重啟 / 取消」，文字指令則是 60 秒內回 `/confirm`。`/redeploy`
+共用同一段確認流程。
 
 靜音只擋主動推送，指令回覆照常。靜音期間的事件**仍會寫進歷史**，解除後用
 `/log` 補看。
+
+## 忘記某個裝置或 app（/forget）
+
+有些裝置或 app 就是不會再處理了（裝置賣掉、app 不用了），但只要它還留在
+Sideloadly 的資料庫裡，`monitor.py` 就會一直為它發過期/離線告警，`restart.py`
+也會一直把它列進「需要重啟」的理由。`/forget`（`/forgotten` 查看與復原）讓
+你把這些條目從報表和告警裡拿掉。
+
+**這份清單完全是本專案自己的本機狀態（`ignored.json`），跟 `installations.db`
+無關。** 那個資料庫是 Sideloadly 的內部狀態，這個專案從頭到尾唯讀開啟、不寫
+入（見下方「架構」一節）——forget 因此不可能、也不會去改 Sideloadly 自己的
+資料，只是在讀出來之後多一層本機過濾。忘記一整台裝置會連帶忘記它底下所有
+app，不用逐一忘記；忘記單一 app 則不影響同裝置上的其他 app。`common.py` 的
+`visible_installs()` / `visible_devices()` 是唯一的過濾點，`build_status_report`
+/ `build_device_report`、`monitor.py` 的偵測迴圈、`restart.py` 的自動重啟判斷
+三處都經過它——少了任何一處，忘記的東西還是會用某種方式冒出來。
+
+## 重新部署（/redeploy）——其實就是重啟
+
+Sideloadly 沒有公開任何「只重簽這一個 app」的介面。它的 `installations` 表裡
+雖然有 `enqueued_at` / `enqueue_token` 兩個看起來像是手動觸發重簽用的欄位，
+但格式沒有文件，而且這個專案刻意「唯讀開啟、不寫入」那個資料庫（見下方架構
+一節）——瞎猜格式寫進去，寫錯有可能讓 daemon 或 Sideloadly 自己的邏輯出問題，
+風險不值得。
+
+所以 `/redeploy` 實際上做的事跟 `/restart`完全一樣：`launchctl kickstart -k`
+整顆 daemon。差別只在於它讓你先選一個 app，訊息和 `history.py` 的紀錄會點名
+「為了哪個 app」——方便事後回頭看「這次重啟是為了處理誰」，而不是假裝這是
+一個只影響單一 app、不會打斷其他裝置刷新的動作。兩者共用同一段 60 秒確認
+流程與同一顆 `restart:go` 按鈕，避免同一段重啟邏輯被複製兩份。
 
 ## 報表排版
 
@@ -129,6 +163,7 @@
 ./query.py devices    # 同 /devices
 ./query.py log
 ./query.py stats
+./query.py forgotten  # 同 /forgotten
 ./query.py daemon     # launchd 看到的 daemon state
 ./restart.py          # 只在有問題時重啟
 ./restart.py --force  # 無視判斷直接重啟
@@ -184,6 +219,7 @@ Sideloadly daemon（`config.py` 的 `RESTART_LABEL`），如果你的環境 labe
 - `events.db` — 事件歷史，`/log` 和 `/stats` 的來源
 - `mute_until.txt` — 靜音到期時間，存在才算靜音
 - `bot_offset.txt` — Telegram update offset
+- `ignored.json` — `/forget` 忘記的裝置/app 清單（見上方「忘記某個裝置或 app」）
 
 ## 測試
 
