@@ -19,8 +19,7 @@ import ignore
 # 註冊給 Telegram，聊天室輸入框旁就會出現指令選單。
 BOT_COMMANDS = [
     {"command": "menu", "description": "功能選單"},
-    {"command": "status", "description": "各 app 到期倒數"},
-    {"command": "devices", "description": "裝置連線狀態"},
+    {"command": "status", "description": "裝置、app 到期倒數與問題"},
     {"command": "accounts", "description": "Apple ID 額度狀態"},
     {"command": "log", "description": "最近異常紀錄"},
     {"command": "stats", "description": "刷新統計"},
@@ -37,9 +36,6 @@ MENU_KEYBOARD = {
     "inline_keyboard": [
         [
             {"text": "📊 狀態", "callback_data": "status"},
-            {"text": "📱 裝置", "callback_data": "devices"},
-        ],
-        [
             {"text": "🆔 Apple ID 額度", "callback_data": "accounts"},
         ],
         [
@@ -82,8 +78,7 @@ MENU_TEXT = (
 HELP_TEXT = (
     "Sideloadly 監控\n\n"
     "/menu - 功能選單（按鈕）\n"
-    "/status - 各 app 到期倒數與問題\n"
-    "/devices - 裝置連線狀態\n"
+    "/status - 每台裝置的連線狀態、上面有哪些 app（誰簽的、剩多久）與問題\n"
     "/accounts - 各 Apple ID 本週 App ID 額度\n"
     "/log [n] - 最近異常紀錄（預設 15 筆）\n"
     "/stats [天數] - 刷新統計與平均間隔（預設 7 天）\n"
@@ -210,9 +205,6 @@ def dispatch(action: str, args: list[str]):
             else MENU_KEYBOARD
         )
         common.send_report(common.build_status_report(), reply_markup=markup)
-
-    elif action == "devices":
-        common.send_report(common.build_device_report(), reply_markup=MENU_KEYBOARD)
 
     elif action == "accounts":
         common.send_report(common.build_account_report(), reply_markup=MENU_KEYBOARD)

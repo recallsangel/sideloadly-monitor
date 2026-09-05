@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """在終端機看報表，不經過 Telegram。
 
-用法：query.py [status|devices|log|stats|daemon]
+用法：query.py [status|log|stats|forgotten|daemon]
 """
 import sys
 
@@ -10,7 +10,6 @@ import history
 
 REPORTS = {
     "status": common.build_status_report,
-    "devices": common.build_device_report,
     "log": history.build_log_report,
     "stats": history.build_stats_report,
     "forgotten": common.build_ignored_report,

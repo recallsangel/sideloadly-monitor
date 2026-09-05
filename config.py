@@ -66,6 +66,10 @@ RESTART_VERIFY_INTERVAL_SECONDS = 2
 # 整則訊息炸開（Telegram 單則訊息的按鈕數也有上限）。
 PICKER_MAX_BUTTONS = 20
 
+# 報表裡的 Apple ID 只留本地端前幾個字（見 common.short_apple_id）。一行要同時
+# 塞下 app 名、到期倒數、帳號，完整帳號動輒 20 字以上會把表格擠到要橫向捲。
+APPLE_ID_LOCAL_WIDTH = 5
+
 # Telegram 單則訊息上限 4096 字元，送出前依此切段。
 MESSAGE_CHUNK_LIMIT = 3900
 # 報表會再包一層 <pre> 並做 HTML escape，字數會膨脹，留多一點餘裕。

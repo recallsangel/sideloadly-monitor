@@ -397,15 +397,33 @@ def suggest_alternate_account(
 SEVERITY_ORDER = ["🔴 已過期", "❌ 刷新失敗", "⚠ 逾期未刷新", "📵 裝置離線"]
 
 
+def short_apple_id(apple_id: str | None) -> str:
+    """報表欄位用的短版 Apple ID：本地端截短，網域整個留著。
+
+    一行要同時塞下 app 名、到期倒數跟帳號，而報表是包在 <pre> 裡送出的——
+    Telegram 不會換行，只會變成要橫向捲，等於把表格對齊的意義整個抵銷。
+    帳號通常前幾個字就分得出來，網域留著是因為 gmail/icloud 本身就是辨識點。"""
+    if not apple_id:
+        return ""
+    local, _, domain = apple_id.partition("@")
+    if len(local) > config.APPLE_ID_LOCAL_WIDTH:
+        local = local[: config.APPLE_ID_LOCAL_WIDTH] + "..."
+    return f"{local}@{domain}" if domain else local
+
+
 def build_status_report() -> str:
+    """一份報表講完三件事：哪裡有問題、每台裝置的連線狀態、每台裝置上有哪些
+    app（誰簽的、還剩多久）。原本 /devices 是獨立一份，但它講的東西這裡本來
+    就有——分成兩個指令只是逼人自己在腦裡把兩張表拼起來。"""
     installs = visible_installs()
-    if not installs:
+    devices = visible_devices()
+    if not installs and not devices:
         return "沒有任何裝置資料。"
 
-    devices = {d.udid: d for d in visible_devices()}
     by_device: dict[str, list[Install]] = {}
     for inst in installs:
         by_device.setdefault(inst.device_udid, []).append(inst)
+    device_by_udid = {d.udid: d for d in devices}
 
     # 先挑出問題，健康時整份報表就只有一行標題加表格。
     problems: dict[str, list[str]] = {}
@@ -430,8 +448,9 @@ def build_status_report() -> str:
             markers[inst.id] = "❌"
 
     for udid in by_device:
-        device = devices.get(udid)
-        # 只回報有 app 在跑的裝置，閒置裝置離線不算問題。
+        device = device_by_udid.get(udid)
+        # 只有「有 app 在跑」的裝置離線才算問題，閒置裝置離線不算——但下面的
+        # 表格仍會把它列出來，這是 /devices 併進來之後唯一還看得到它的地方。
         if device and device.offline:
             problems.setdefault(SEVERITY_ORDER[3], []).append(
                 f"{device.name}：最後連線 {device.seen_text()}"
@@ -455,7 +474,7 @@ def build_status_report() -> str:
         lines.append("")
 
     latest = max((i.last_updated for i in installs if i.last_updated), default=None)
-    summary = f"{len(installs)} 個 app · {len(by_device)} 台裝置"
+    summary = f"{len(devices)} 台裝置・{len(installs)} 個 app"
     if latest:
         summary += (
             "　最近刷新 "
@@ -465,34 +484,62 @@ def build_status_report() -> str:
     lines.append(summary)
     lines.append("")
 
-    # 名稱欄寬度取所有裝置名與縮排後 app 名的最大值，整份報表共用同一欄。
+    # installs 指到的裝置在 devices 表裡查不到時（資料不一致），還是要列出來，
+    # 否則這些 app 會整組從報表消失——那是最不該被安靜吃掉的一種狀況。
+    orphan_udids = [udid for udid in by_device if udid not in device_by_udid]
+
+    # 三個欄位共用同一組寬度，整份報表才對得齊：名稱、到期倒數、Apple ID。
+    device_names = [d.name for d in devices] + [
+        by_device[udid][0].device_name for udid in orphan_udids
+    ]
     name_width = 2 + max(
-        max(display_width(g[0].device_name) for g in by_device.values()),
-        max(2 + display_width(i.app_name) for i in installs),
+        max((display_width(n) for n in device_names), default=0),
+        max((2 + display_width(i.app_name) for i in installs), default=0),
     )
-    # 問題標記統一貼在倒數欄之後，讓每行的標記垂直對齊。
-    marker_col = name_width + 2 + max(
-        display_width(i.expiry_short()) for i in installs
+    expiry_width = 2 + max(
+        (display_width(i.expiry_short()) for i in installs), default=0
+    )
+    account_width = 2 + max(
+        (display_width(short_apple_id(i.apple_id)) for i in installs), default=0
     )
 
-    for udid, group in by_device.items():
-        device = devices.get(udid)
-        header = pad(group[0].device_name, name_width)
-        if device:
-            header += device.seen_label()
-            if device.offline:
-                header += "  📵"
+    def render_device(device: Device, group: list[Install]):
+        header = pad(device.name, name_width) + device.seen_label()
+        if device.offline:
+            header += "  📵"
         lines.append(header.rstrip())
-        if device and device.last_error:
+        if device.last_error:
             lines.append(f"    裝置錯誤：{device.last_error}")
-
+        if not group:
+            lines.append("  （沒有 app）")
         for inst in sorted(group, key=lambda i: i.seconds_to_expiry or -1e9):
-            row = "  " + pad(inst.app_name, name_width - 2) + inst.expiry_short()
+            row = (
+                "  "
+                + pad(inst.app_name, name_width - 2)
+                + pad(inst.expiry_short(), expiry_width)
+                + pad(short_apple_id(inst.apple_id), account_width)
+            )
             marker = markers.get(inst.id)
             if marker:
-                row = pad(row, marker_col) + marker
+                row += marker
             lines.append(row.rstrip())
         lines.append("")
+
+    for device in devices:
+        render_device(device, by_device.get(device.udid, []))
+
+    for udid in orphan_udids:
+        group = by_device[udid]
+        render_device(
+            Device(
+                udid=udid,
+                name=group[0].device_name,
+                last_seen=None,
+                last_error="裝置不在 devices 表裡",
+                failures_count=0,
+            ),
+            group,
+        )
 
     mute = mute_remaining()
     if mute:
@@ -530,33 +577,6 @@ def build_ignored_report() -> str:
         lines.append("")
         lines.append("app：")
         lines.extend(f"  · {i.device_name} - {i.app_name}" for i in installs)
-    return "\n".join(lines)
-
-
-def build_device_report() -> str:
-    devices = visible_devices()
-    if not devices:
-        return "沒有任何裝置資料。"
-
-    offline = [d for d in devices if d.offline]
-    lines = [
-        f"⚠ {len(offline)} 台離線 / 共 {len(devices)} 台"
-        if offline
-        else f"🟢 {len(devices)} 台裝置全部在線",
-        "",
-    ]
-
-    name_width = 2 + max(display_width(d.name) for d in devices)
-    for device in devices:
-        row = pad(device.name, name_width) + device.seen_label()
-        if device.offline:
-            row += "  📵"
-        lines.append(row)
-        if device.last_error:
-            lines.append(
-                f"  {' ' * name_width}錯誤：{device.last_error}"
-                f"（{device.failures_count} 次）"
-            )
     return "\n".join(lines)
 
 

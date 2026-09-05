@@ -183,7 +183,7 @@ check("偵測到 monitor 恢復", "恢復" in sent_text())
 # ------------------------------------------------------------------- 報表
 
 for name, fn in (("/status", common.build_status_report),
-                 ("/devices", common.build_device_report),
+                 ("/forgotten", common.build_ignored_report),
                  ("/log", history.build_log_report),
                  ("/stats", history.build_stats_report)):
     output = fn()
@@ -197,6 +197,23 @@ check("長訊息會切段", len(common._chunk("x\n" * 4000, 3400)) > 1)
 # 表格欄位要對齊：中文字寬度算 2 才不會歪
 check("寬度計算把中文算兩格", common.display_width("裝置ab") == 6)
 check("padding 依顯示寬度補齊", common.display_width(common.pad("裝置", 10)) == 10)
+
+# /devices 併進 /status 之後，原本只有 /devices 交代的東西不能跟著消失。
+status_report = common.build_status_report()
+check("/status 交代裝置連線狀態", "連線" in status_report)
+check("/status 標出每個 app 是哪個 Apple ID 簽的",
+      all(common.short_apple_id(i.apple_id) in status_report
+          for i in common.visible_installs() if i.apple_id))
+appless_devices = [
+    d for d in common.visible_devices()
+    if not any(i.device_udid == d.udid for i in common.visible_installs())
+]
+check("/status 連沒有 app 的裝置也列出來（原本只有 /devices 看得到）",
+      all(d.name in status_report for d in appless_devices))
+check("Apple ID 截短後仍看得出網域",
+      common.short_apple_id("jackscykmi@gmail.com").endswith("@gmail.com"))
+check("短帳號不會被截", common.short_apple_id("abc@x.com") == "abc@x.com")
+check("沒有 apple_id 就是空字串", common.short_apple_id(None) == "")
 
 
 # ------------------------------------------------------------- 選單與按鈕
@@ -256,6 +273,11 @@ check("非授權 chat 不回應", not SENT)
 say("/nonsense")
 check("未知指令回說明", "/menu" in sent_text())
 
+say("/devices")
+check("/devices 已併入 /status，不再是獨立指令", "看不懂這個指令" in sent_text())
+check("指令清單已移除 devices",
+      "devices" not in {c["command"] for c in bot.BOT_COMMANDS})
+
 check("指令清單有註冊項目", len(bot.BOT_COMMANDS) >= 8)
 check(
     "指令清單含 forget/forgotten/redeploy",
@@ -288,8 +310,8 @@ check("忘記裝置後 visible_devices 看不到它",
       not any(d.udid == target_device.udid for d in common.visible_devices()))
 check("忘記裝置後 visible_installs 連帶看不到它底下的 app",
       not any(i.device_udid == target_device.udid for i in common.visible_installs()))
-check("忘記裝置後 /devices 報表不再提到它",
-      target_device.name not in common.build_device_report())
+check("忘記裝置後 /status 報表不再提到它",
+      target_device.name not in common.build_status_report())
 
 ignore.unignore_device(target_device.udid)
 check("復原後 visible_devices 恢復看得到",

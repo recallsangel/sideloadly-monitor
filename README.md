@@ -63,8 +63,7 @@
 
 ```
 /menu           功能選單（按鈕）
-/status         各 app 的到期倒數與問題
-/devices        各裝置連線狀態
+/status         每台裝置的連線狀態、上面有哪些 app（誰簽的、剩多久）與問題
 /accounts       各 Apple ID 本週 App ID 額度
 /log [n]        最近的異常紀錄（預設 15 筆）
 /stats [天數]   刷新/失敗次數與平均間隔（預設 7 天）
@@ -96,9 +95,9 @@ Sideloadly 的資料庫裡，`monitor.py` 就會一直為它發過期/離線告�
 入（見下方「架構」一節）——forget 因此不可能、也不會去改 Sideloadly 自己的
 資料，只是在讀出來之後多一層本機過濾。忘記一整台裝置會連帶忘記它底下所有
 app，不用逐一忘記；忘記單一 app 則不影響同裝置上的其他 app。`common.py` 的
-`visible_installs()` / `visible_devices()` 是唯一的過濾點，`build_status_report`
-/ `build_device_report`、`monitor.py` 的偵測迴圈、`restart.py` 的自動重啟判斷
-三處都經過它——少了任何一處，忘記的東西還是會用某種方式冒出來。
+`visible_installs()` / `visible_devices()` 是唯一的過濾點，`build_status_report`、
+`monitor.py` 的偵測迴圈、`restart.py` 的自動重啟判斷三處都經過它——少了任何
+一處，忘記的東西還是會用某種方式冒出來。
 
 ## 重新部署（/redeploy）——其實就是重啟
 
@@ -119,18 +118,31 @@ Sideloadly 沒有公開任何「只重簽這一個 app」的介面。它的 `ins
 報表包在 `<pre>` 裡送出，Telegram 才會用等寬字把欄位對齊；padding 用
 `display_width()` 計算，中文字算兩格，否則會歪。
 
+**一份報表講完三件事**：哪裡有問題、每台裝置的連線狀態、每台裝置上有哪些
+app（哪個 Apple ID 簽的、還剩多久）。裝置連線狀態原本是獨立的 `/devices`，
+但它講的東西 `/status` 本來就有——分成兩個指令只是逼人自己在腦裡把兩張表
+拼起來。**沒有 app 的裝置也會列出來**（標成「（沒有 app）」），那是 `/devices`
+併進來之後唯一還看得到閒置裝置的地方。
+
 問題排在最前面，健康時就只有一行結論加表格：
 
 ```
 🟢 一切正常
 
-6 個 app · 4 台裝置　最近刷新 3.7 小時前
+4 台裝置・6 個 app　最近刷新 3.7 小時前
 
 裝置 A   18 分鐘前連線
-  App 1  剩 6.8 天
-  App 2  剩 6.8 天
-  App 3  剩 6.8 天
+  App 1  剩 6.8 天  a4584...@icloud.com
+  App 2  剩 6.8 天  jacks...@gmail.com
+
+裝置 D   57 分鐘前連線
+  （沒有 app）
 ```
+
+Apple ID 只留本地端前幾個字（`common.short_apple_id`，長度是
+`config.APPLE_ID_LOCAL_WIDTH`）：一行要同時塞下 app 名、倒數跟帳號，而
+`<pre>` 不換行，太長只會變成要橫向捲，等於把對齊的意義整個抵銷。網域整個
+留著，因為 gmail/icloud 本身就是一種辨識。
 
 有狀況時先給摘要，表格內對應的那幾行右側也會標記：
 
@@ -149,18 +161,18 @@ Sideloadly 沒有公開任何「只重簽這一個 app」的介面。它的 `ins
 ...
 
 裝置 A   19 分鐘前連線
-  App 2  剩 2.0 天      ⚠
-  App 1  剩 6.8 天
-  App 3  剩 6.8 天      ❌
+  App 2  剩 2.0 天      a4584...@icloud.com  ⚠
+  App 1  剩 6.8 天      a4584...@icloud.com
+  App 3  剩 6.8 天      jacks...@gmail.com   ❌
 ```
 
-每台裝置內部依剩餘時間排序，快過期的自動浮到上面。
+每台裝置內部依剩餘時間排序，快過期的自動浮到上面。**只有「有 app 在跑」的
+裝置離線才會進問題區**——閒置裝置離線不算問題，但它仍然會出現在下面的表格裡。
 
 ## 終端機用法
 
 ```sh
 ./query.py            # 同 /status
-./query.py devices    # 同 /devices
 ./query.py log
 ./query.py stats
 ./query.py forgotten  # 同 /forgotten
