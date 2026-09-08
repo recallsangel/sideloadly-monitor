@@ -22,7 +22,8 @@ CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind);
 """
 
 # kind 一覽：refresh / failure / recovery / overdue / expired
-#            device_offline / device_online / restart / monitor_stale
+#            device_offline / device_online / restart / usbmuxd_restart
+#            usbmuxd_stuck / usbmuxd_ok / monitor_stale
 
 KIND_LABELS = {
     "refresh": "刷新完成",
@@ -33,6 +34,9 @@ KIND_LABELS = {
     "device_offline": "裝置離線",
     "device_online": "裝置回線",
     "restart": "重啟 daemon",
+    "usbmuxd_restart": "重啟 usbmuxd",
+    "usbmuxd_stuck": "usbmuxd 異常",
+    "usbmuxd_ok": "usbmuxd 恢復",
     "monitor_stale": "監控停擺",
 }
 
@@ -77,6 +81,7 @@ def recent(limit: int = 15, kinds: list[str] | None = None) -> list[sqlite3.Row]
 def build_log_report(limit: int = 15) -> str:
     rows = recent(limit, kinds=["failure", "recovery", "overdue", "expired",
                                 "device_offline", "device_online", "restart",
+                                "usbmuxd_restart", "usbmuxd_stuck", "usbmuxd_ok",
                                 "monitor_stale"])
     if not rows:
         return "沒有任何異常紀錄。"
