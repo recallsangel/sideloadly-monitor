@@ -44,6 +44,12 @@ def main():
     if not config.SIDELOADLY_DB_PATH.exists():
         return
 
+    # 順手收 Sideloadly daemon 的日誌。不推播——這是例行家務，不是告警；
+    # 印出來就好，launchd 會收進 monitor.log。
+    rotated = common.rotate_daemon_log()
+    if rotated:
+        print(rotated, flush=True)
+
     state = load_state()
     first_run = not state["installations"]
     today = datetime.now(timezone.utc).date().isoformat()

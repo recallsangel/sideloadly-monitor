@@ -30,6 +30,9 @@ config.STATE_PATH = TMP / "state.json"
 config.EVENTS_DB_PATH = TMP / "events.db"
 config.MUTE_PATH = TMP / "mute_until.txt"
 config.IGNORED_PATH = TMP / "ignored.json"
+# monitor.main() 每輪都會輪替 daemon 日誌，所以這條路徑在整份測試裡都不能指到
+# 真實檔案——只在用到的那一段才導開是不夠的：那之後還有十幾次 monitor.main()。
+config.DAEMON_LOG_PATH = TMP / "daemon.err.log"
 
 import bot
 import common
@@ -151,6 +154,41 @@ db("UPDATE devices SET last_seen = ? WHERE udid = ?", ts(minutes=-2), OFFLINE_UD
 body = run("recovery")
 check("偵測到錯誤解除", "錯誤已解除" in body)
 check("偵測到裝置回線", "裝置回線" in body)
+
+# --------------------------------------------------- daemon 日誌輪替
+
+# 路徑在檔案最上面就導到 TMP 了，這裡只要把門檻縮小到測得動的尺寸，
+# 結束時務必還原——否則後面每次 monitor.main() 都會拿 1000 bytes 的門檻去砍。
+_real_max, _real_keep = config.DAEMON_LOG_MAX_BYTES, config.DAEMON_LOG_KEEP_BYTES
+config.DAEMON_LOG_MAX_BYTES = 1000
+config.DAEMON_LOG_KEEP_BYTES = 200
+
+check("檔案不存在時不做事", common.rotate_daemon_log() is None)
+
+config.DAEMON_LOG_PATH.write_bytes(b"x" * 500)
+check("沒超過上限時不做事", common.rotate_daemon_log() is None)
+check("沒超過上限時檔案原封不動", config.DAEMON_LOG_PATH.stat().st_size == 500)
+
+# 尾巴要留得到：最後 200 bytes 是可辨識的內容，前面才是填充。
+config.DAEMON_LOG_PATH.write_bytes(b"o" * 2000 + b"TAIL" * 50)
+result = common.rotate_daemon_log()
+check("超過上限就輪替", result is not None and "已清空" in result)
+check("原檔被清空", config.DAEMON_LOG_PATH.stat().st_size == 0)
+
+kept = config.DAEMON_LOG_PATH.with_name(config.DAEMON_LOG_PATH.name + ".1")
+check("尾巴另存成 .1", kept.exists())
+check("留下的是最後那一段而不是開頭", kept.read_bytes() == b"TAIL" * 50)
+
+# 清空而不是改名，是因為 launchd 開著這個檔的 fd。改名的話 daemon 會繼續往
+# 舊 inode 寫，新檔永遠是空的——所以原檔的 inode 必須不變。
+before_inode = config.DAEMON_LOG_PATH.stat().st_ino
+config.DAEMON_LOG_PATH.write_bytes(b"z" * 2000)
+common.rotate_daemon_log()
+check("輪替後仍是同一個 inode（沒有改名）",
+      config.DAEMON_LOG_PATH.stat().st_ino == before_inode)
+
+config.DAEMON_LOG_MAX_BYTES, config.DAEMON_LOG_KEEP_BYTES = _real_max, _real_keep
+config.DAEMON_LOG_PATH.unlink(missing_ok=True)
 
 # ------------------------------------------------------------------- 靜音
 

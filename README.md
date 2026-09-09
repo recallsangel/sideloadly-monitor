@@ -246,6 +246,47 @@ Sideloadly daemon（`config.py` 的 `RESTART_LABEL`），如果你的環境 labe
 
 對應環境變數：`SIDELOADLY_MONITOR_BOT_TOKEN`、`SIDELOADLY_MONITOR_CHAT_ID`。
 
+## Sideloadly daemon 的日誌
+
+Sideloadly 卡住的時候原本查不到任何東西，因為**它內建的日誌功能從來沒運作過**：
+daemon 會在「目前工作目錄」建 `sideloadlydaemon.log`，而 launchd 啟動的行程工作
+目錄是 `/`，macOS 的系統卷唯讀，所以每次啟動都寫失敗然後一聲不吭繼續跑：
+
+```
+Log file creating failed open sideloadlydaemon.log: read-only file system
+```
+
+解法是在它的 LaunchAgent 補上 `StandardErrorPath`（改之前先備份）：
+
+```sh
+P=~/Library/LaunchAgents/io.sideloadly.daemon.plist
+cp "$P" "$P.bak"
+/usr/libexec/PlistBuddy -c "Add :StandardErrorPath string $HOME/Library/Logs/sideloadly-daemon.err.log" "$P"
+launchctl bootout gui/$(id -u)/io.sideloadly.daemon
+launchctl bootstrap gui/$(id -u) "$P"
+```
+
+日誌會顯示每次 tick、每個裝置的上下線事件、每個安裝決策。卡住時這樣看：
+
+```sh
+tail -100 ~/Library/Logs/sideloadly-daemon.err.log | grep -v "Checking installed app"
+```
+
+`grep -v` 是濾掉「列出裝置上全部已安裝 app」的雜訊（一台五十幾個），剩下的是
+tick 骨架。**卡點的樣子是某個 `Will tick` 後面沒有對應的 `Done tick`**，或是
+`Got ins` 之後就沒下文。
+
+### 輪替
+
+那些雜訊讓日誌長得很快（實測約 200 MB/天），所以 `monitor.py` 每輪會呼叫
+`common.rotate_daemon_log()`：超過 `DAEMON_LOG_MAX_BYTES` 就把最後
+`DAEMON_LOG_KEEP_BYTES` 存成 `.1`，然後**原地清空**原檔。
+
+原地清空而不是改名，是因為 launchd 開著這個檔的 fd——改名的話 daemon 會繼續往
+改名後的那個 inode 寫，新建的檔永遠是空的。清空可行是因為 launchd 用 `O_APPEND`
+開檔，下一次寫入會自己回到檔頭接上（實測驗證過）。留一份尾巴則是為了避免「剛好
+在卡住之後才輪替」把要查的證據丟掉。
+
 ## 產生的檔案（都不進版控）
 
 - `state.json` — 上輪快照 + `last_run` 心跳

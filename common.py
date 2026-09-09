@@ -654,3 +654,45 @@ def perform_restart(verify: bool = True) -> tuple[bool, str]:
     return False, (
         f"已送出重啟指令，但 daemon 沒回到 running（state={daemon_state()}）"
     )
+
+
+def rotate_daemon_log() -> str | None:
+    """Sideloadly daemon 的 stderr 超過上限就留一份尾巴、然後原地清空。
+
+    一定要「原地清空」而不是改名：launchd 開著這個檔的 fd，改名之後 daemon 會
+    繼續往改名後的那個 inode 寫，新建的檔案永遠是空的。清空可以，因為 launchd
+    是用 O_APPEND 開的，下一次寫入會自己回到檔頭接上。
+
+    沒超過上限或檔案不存在回 None，做了事才回一句話。
+    """
+    path = config.DAEMON_LOG_PATH
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return None
+    if size <= config.DAEMON_LOG_MAX_BYTES:
+        return None
+
+    keep = path.with_name(path.name + ".1")
+    try:
+        with path.open("rb") as src:
+            src.seek(max(0, size - config.DAEMON_LOG_KEEP_BYTES))
+            tail = src.read()
+        keep.write_bytes(tail)
+        with path.open("r+b") as dst:
+            dst.truncate(0)
+    except OSError as exc:
+        return f"daemon 日誌輪替失敗: {exc}"
+    return (
+        f"daemon 日誌已清空（{_size_text(size)}），"
+        f"最後 {_size_text(len(tail))} 留在 {keep.name}"
+    )
+
+
+def _size_text(num_bytes: int) -> str:
+    """檔案大小講成人話。用不到 1 MB 的門檻跑測試時，整數 MB 會顯示成 0。"""
+    if num_bytes < 1024:
+        return f"{num_bytes} bytes"
+    if num_bytes < 1048576:
+        return f"{num_bytes / 1024:.0f} KB"
+    return f"{num_bytes / 1048576:.0f} MB"
