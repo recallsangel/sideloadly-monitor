@@ -49,18 +49,6 @@ def fake_api(method, **params):
 common.api = fake_api
 
 
-def fake_usbmux(result):
-    """換掉 usbmuxd 查詢。result 是裝置清單，或 None 代表連不上。"""
-    common.usbmux_list_devices = lambda: result
-
-
-# usbmuxd 是真的系統服務，測試不能真的去弄壞它，也不該讓結果取決於這台機器當下
-# 的 usbmuxd 是好是壞——它正好卡死的話，前面每個場景都會多冒一則 usbmuxd 告警，
-# 然後真正要測它的那段反而因為當天已通知過而被去重擋掉。預設回健康，要測的
-# 場景自己改。
-fake_usbmux([{"Properties": {"SerialNumber": "healthy", "ConnectionType": "Network"}}])
-
-
 def sent_text() -> str:
     return "\n\n".join(s.get("text", "") for s in SENT if s["method"] == "sendMessage")
 
@@ -102,7 +90,7 @@ def check(name, condition):
 
 # 挑一台裝置專門用來測「上線 → 離線 → 回線」的轉場。
 #
-# 這裡跟上面 install_ids 是同一種坑：原本寫死 WHERE rowid = 1，而真實資料裡
+# 這裡跟下面 install_ids 是同一種坑：原本寫死 WHERE rowid = 1，而真實資料裡
 # rowid 1 剛好是 last_seen 為 sideloadly 零值（0001-01-01，代表從未連線）的
 # 裝置。那種裝置本來就算離線，於是在「建立基準」那一輪就被記進
 # device_offline_notified，之後不管怎麼改 last_seen 都不會再觸發告警——測試
@@ -163,44 +151,6 @@ db("UPDATE devices SET last_seen = ? WHERE udid = ?", ts(minutes=-2), OFFLINE_UD
 body = run("recovery")
 check("偵測到錯誤解除", "錯誤已解除" in body)
 check("偵測到裝置回線", "裝置回線" in body)
-
-# ----------------------------------------------------------------- usbmuxd
-
-def clear_usbmuxd_notified():
-    """把 usbmuxd 的每日去重旗標清掉，好接著測下一種故障。"""
-    state = json.loads(config.STATE_PATH.read_text())
-    state.pop("usbmuxd_notified", None)
-    config.STATE_PATH.write_text(json.dumps(state, ensure_ascii=False))
-
-
-# 「連得上但一台都看不到」＝卡死，正是這個功能要抓的那種。
-fake_usbmux([])
-body = run("usbmuxd stuck")
-check("偵測到 usbmuxd 卡死", "usbmuxd 異常" in body)
-check("告警講清楚重啟 daemon 沒用", "重啟 daemon 沒用" in body)
-check("同日不重複提醒 usbmuxd", "usbmuxd 異常" not in run("usbmuxd stuck again"))
-
-# 連不上（服務整個沒在跑）也要報，訊息要跟上面那種分得出來。
-clear_usbmuxd_notified()
-fake_usbmux(None)
-check("偵測到 usbmuxd 連不上", "連不上 usbmuxd" in run("usbmuxd down"))
-
-# 恢復。
-fake_usbmux([{"Properties": {"SerialNumber": OFFLINE_UDID, "ConnectionType": "Network"}}])
-body = run("usbmuxd recovered")
-check("偵測到 usbmuxd 恢復", "usbmuxd 恢復" in body)
-check("恢復訊息報出看到幾台", "1 台裝置" in body)
-check("恢復後不再重複報恢復", "usbmuxd 恢復" not in run("usbmuxd still fine"))
-
-# 只有一台裝置在冊時，那台出門就會讓 usbmuxd 回 0 台——那是常態，不該告警。
-_real_visible_devices = common.visible_devices
-common.visible_devices = lambda: _real_visible_devices()[:1]
-fake_usbmux([])
-check("只有一台裝置時不誤報 usbmuxd", "usbmuxd 異常" not in run("single device"))
-common.visible_devices = _real_visible_devices
-
-# 後面還有別的場景要跑，把 usbmuxd 放回健康，免得它們多出無關的告警。
-fake_usbmux([{"Properties": {"SerialNumber": "healthy", "ConnectionType": "Network"}}])
 
 # ------------------------------------------------------------------- 靜音
 

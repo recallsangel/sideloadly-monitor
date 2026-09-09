@@ -24,7 +24,6 @@ BOT_COMMANDS = [
     {"command": "log", "description": "最近異常紀錄"},
     {"command": "stats", "description": "刷新統計"},
     {"command": "restart", "description": "重啟 Sideloadly daemon"},
-    {"command": "usbmuxd", "description": "重啟 usbmuxd（裝置全都看不到時用）"},
     {"command": "redeploy", "description": "為某個 app 重新部署（重啟 daemon）"},
     {"command": "forget", "description": "忘記某個裝置或 app"},
     {"command": "forgotten", "description": "查看/復原忘記清單"},
@@ -55,9 +54,6 @@ MENU_KEYBOARD = {
             {"text": "🔄 重啟 daemon", "callback_data": "restart"},
             {"text": "🔁 重新部署", "callback_data": "redeploy"},
         ],
-        [
-            {"text": "🔌 重啟 usbmuxd", "callback_data": "usbmuxd"},
-        ],
     ]
 }
 
@@ -65,15 +61,6 @@ CONFIRM_KEYBOARD = {
     "inline_keyboard": [
         [
             {"text": "✅ 確定重啟", "callback_data": "restart:go"},
-            {"text": "取消", "callback_data": "menu"},
-        ]
-    ]
-}
-
-USBMUXD_CONFIRM_KEYBOARD = {
-    "inline_keyboard": [
-        [
-            {"text": "✅ 確定重啟 usbmuxd", "callback_data": "usbmuxd:go"},
             {"text": "取消", "callback_data": "menu"},
         ]
     ]
@@ -96,9 +83,6 @@ HELP_TEXT = (
     "/log [n] - 最近異常紀錄（預設 15 筆）\n"
     "/stats [天數] - 刷新統計與平均間隔（預設 7 天）\n"
     "/restart - 重啟 daemon（需確認）\n"
-    "/usbmuxd - 重啟 usbmuxd（需確認）。usbmuxd 是 macOS 負責找 iOS 裝置的系統"
-    "服務，Sideloadly 完全靠它；它卡死的時候裝置明明都在 Wi-Fi 上卻一台都不會"
-    "出現，而且重啟 daemon 沒有用，只能重啟它\n"
     "/redeploy - 為某個 app 重新部署（需確認；動作跟 /restart 一樣是整顆"
     "daemon 重啟，只是訊息和紀錄會點名是為了哪個 app）\n"
     "/forget - 忘記某個裝置或 app，之後不再收到它的告警（只是本機清單，"
@@ -116,10 +100,6 @@ DEFAULT_MUTE_HOURS = 8
 # {"until": datetime, "reason": str | None} — reason 是 /redeploy 點名的 app，
 # 一般 /restart 沒有 reason。兩者共用同一段確認流程與同一個 restart:go 按鈕。
 _pending_restart: dict | None = None
-# /usbmuxd 的確認時限。跟 _pending_restart 分開放，因為兩者動的是完全不同的東西
-# （一個是 Sideloadly 的 daemon，一個是 macOS 的系統服務），共用一格會讓「按了
-# A 的確認鈕結果重啟到 B」變成可能。
-_pending_usbmuxd_until: datetime | None = None
 _heartbeat_alerted_at: datetime | None = None
 _heartbeat_was_stale = False
 
@@ -212,8 +192,7 @@ def _int_arg(args: list[str], default: int, lo: int, hi: int) -> int:
 
 def dispatch(action: str, args: list[str]):
     """文字指令和按鈕共用同一套動作。"""
-    global _pending_restart, _pending_usbmuxd_until
-    global _forget_candidates, _unforget_candidates
+    global _pending_restart, _forget_candidates, _unforget_candidates
 
     if action == "menu":
         common.send_message(MENU_TEXT, reply_markup=MENU_KEYBOARD)
@@ -259,35 +238,6 @@ def dispatch(action: str, args: list[str]):
         common.send_message(
             ("✅ " if ok else "❌ ") + result, reply_markup=MENU_KEYBOARD
         )
-
-    elif action == "usbmuxd":
-        if not args or args[0] != "go":
-            devices = common.usbmux_list_devices()
-            if devices is None:
-                current = "現在連 usbmuxd 都連不上。"
-            else:
-                current = common.describe_usbmux_devices(devices) + "。"
-            _pending_usbmuxd_until = datetime.now(timezone.utc) + CONFIRM_WINDOW
-            common.send_message(
-                f"🔌 {current}\n\n"
-                "確定要重啟 usbmuxd？這是 macOS 的系統服務，重啟期間所有裝置會"
-                "短暫斷線，正在進行的刷新也會被打斷。Wi-Fi 裝置要再等一下才會"
-                "重新出現。60 秒內確認，或直接忽略。",
-                reply_markup=USBMUXD_CONFIRM_KEYBOARD,
-            )
-            return
-
-        if _pending_usbmuxd_until is None or datetime.now(timezone.utc) > _pending_usbmuxd_until:
-            _pending_usbmuxd_until = None
-            common.send_message("確認已逾時，請重新操作。", reply_markup=MENU_KEYBOARD)
-            return
-        _pending_usbmuxd_until = None
-        common.send_message("正在重啟 usbmuxd，最多要等 20 秒…")
-        ok, result = common.perform_usbmuxd_restart()
-        # 結果訊息可能有好幾行（補 sudoers 的指令、Wi-Fi 要再等一下的提醒），
-        # 完整版送 Telegram 就好，/log 只留第一行當標題。
-        history.record("usbmuxd_restart", detail=f"telegram: {result.splitlines()[0]}")
-        common.send_message(("✅ " if ok else "❌ ") + result, reply_markup=MENU_KEYBOARD)
 
     elif action == "redeploy":
         target = args[0] if args else None

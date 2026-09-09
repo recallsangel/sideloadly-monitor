@@ -1,6 +1,5 @@
 import json
 import os
-import pwd
 from pathlib import Path
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -62,38 +61,6 @@ HEARTBEAT_REPEAT_HOURS = 6
 # perform_restart() 送出 kickstart 後，隔多久確認一次 daemon 有沒有回到 running。
 RESTART_VERIFY_ATTEMPTS = 5
 RESTART_VERIFY_INTERVAL_SECONDS = 2
-
-# ---------------------------------------------------------------- usbmuxd
-# usbmuxd 是 macOS 負責探索 iOS 裝置的系統服務，Sideloadly 找不找得到裝置，
-# 最底層完全取決於它。它偶爾會卡死：socket 還在、握手照樣回成功，但裝置一台都
-# 不回報，Sideloadly 於是變成瞎子——重啟 Sideloadly daemon 對這種狀況沒有用，
-# 得把 usbmuxd 砍掉讓 launchd 重新拉起來。
-USBMUXD_PROCESS_NAME = "usbmuxd"
-USBMUXD_SOCKET = "/var/run/usbmuxd"
-# 送給 usbmuxd 的自我介紹字串，只會出現在它自己的日誌裡。
-USBMUXD_CLIENT_NAME = "sideloadly-monitor"
-USBMUXD_TIMEOUT_SECONDS = 5
-
-# 重啟後隔多久確認一次。Wi-Fi 裝置要等 Bonjour 重新探索完才會回來，比 USB 慢得
-# 多，所以查到 0 台不算失敗——等到有裝置就提早收工，次數用完才回報 0。
-USBMUXD_VERIFY_ATTEMPTS = 8
-USBMUXD_VERIFY_INTERVAL_SECONDS = 2
-
-# 「連得上但一台都看不到」要在冊至少這麼多台裝置才判定成 usbmuxd 壞掉。單台裝置
-# 關機或帶出門是常態，全部一起不見才是這個服務的問題；只有一台裝置的環境不該
-# 因為那台出門就整天收到 usbmuxd 告警。
-USBMUXD_MIN_DEVICES_FOR_ALERT = 2
-
-# 重啟 usbmuxd 要 root，但 bot 是一般使用者的 LaunchAgent，沒有 tty 也無從輸入
-# 密碼，所以靠一條只放行這一道指令的 NOPASSWD 規則。安裝方式見 README；沒裝的
-# 話 /usbmuxd 不會有任何動作，只會把該補的那行回給你。
-SUDOERS_PATH = "/etc/sudoers.d/sideloadly-monitor-usbmuxd"
-# 刻意寫死完整參數，不留萬用字元——放行的只有「砍掉名字剛好是 usbmuxd 的行程」，
-# 不是「以 root 執行任意 pkill」。
-SUDOERS_RULE = (
-    f"{pwd.getpwuid(os.getuid()).pw_name} ALL=(root) NOPASSWD: "
-    f"/usr/bin/pkill -x {USBMUXD_PROCESS_NAME}"
-)
 
 # /forget、/forgotten、/redeploy 的選單訊息最多列幾顆按鈕，避免裝置/app 一多
 # 整則訊息炸開（Telegram 單則訊息的按鈕數也有上限）。

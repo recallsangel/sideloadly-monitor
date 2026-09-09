@@ -44,8 +44,6 @@
 | 已過期 | 超過 `known_ttl`（每天最多提醒一次） |
 | 裝置離線 | `devices.last_seen` 超過 `DEVICE_OFFLINE_HOURS` |
 | 裝置回線 | 離線後又出現 |
-| usbmuxd 異常 | 連不上 usbmuxd，或連得上卻一台裝置都看不到（每天最多提醒一次） |
-| usbmuxd 恢復 | 異常後又看得到裝置 |
 | 監控停擺 | `state.json` 的 `last_run` 超過 `HEARTBEAT_STALE_HOURS` 沒更新 |
 
 同一輪的變化會**併成一則訊息**，不會每個 app 各發一次。
@@ -234,50 +232,9 @@ cd sideloadly-monitor
    ```
 
 4. 傳 `/status` 給 bot 確認有回應。
-5. （選用）想用 `/usbmuxd` 的話，加一條 NOPASSWD 規則，見下方「重啟 usbmuxd」。
 
 `restart.py` 預設用 `launchctl kickstart` 重啟 label 為 `io.sideloadly.daemon` 的
 Sideloadly daemon（`config.py` 的 `RESTART_LABEL`），如果你的環境 label 不同要一併改。
-
-## 重啟 usbmuxd
-
-`usbmuxd` 是 macOS 負責探索 iOS 裝置的系統服務，Sideloadly 找不找得到裝置，最底層
-完全取決於它。它偶爾會卡死，症狀很好認：
-
-- 裝置明明都在同一個 Wi-Fi 上，Sideloadly 卻一台都看不到
-- `devices` 表的 `last_seen` 集體停在某個時間點不再前進
-- **重啟 Sideloadly daemon 沒有用**——壞的不是 Sideloadly
-
-`monitor.py` 每小時會順手問一次，發現異常就主動推播，並且把它排在問題區塊的**最
-前面**——底下那串「裝置離線」很可能全是它的下游結果，先看到兇手才不會跑去修錯的
-東西。`/status` 同理。
-
-只有一台裝置在冊時不做「看不到任何裝置」的判定（`USBMUXD_MIN_DEVICES_FOR_ALERT`）：
-單台裝置關機或帶出門是常態，全部一起不見才是這個服務的問題。
-
-確認方法是直接問 usbmuxd 看得到幾台（`/usbmuxd` 的確認訊息裡也會先報一次）：
-
-```sh
-python3 -c "import common; print(common.usbmux_list_devices())"
-```
-
-連得上卻回 `[]`，就是卡死了。唯一的解法是把它砍掉讓 launchd 重新拉起來，這要
-root；bot 是一般使用者的 LaunchAgent，沒有 tty 也無從輸入密碼，所以需要一條只
-放行這一道指令的規則（參數寫死，不留萬用字元——放行的只有「砍掉名字剛好是
-usbmuxd 的行程」，不是「以 root 執行任意 pkill」）：
-
-```sh
-echo "$(whoami) ALL=(root) NOPASSWD: /usr/bin/pkill -x usbmuxd" \
-  | sudo tee /etc/sudoers.d/sideloadly-monitor-usbmuxd
-sudo chmod 440 /etc/sudoers.d/sideloadly-monitor-usbmuxd
-```
-
-裝好之後 `/usbmuxd` 就能用了。沒裝也不會怎樣，`/usbmuxd` 只會把該補的那行回給你，
-不會有任何動作。
-
-重啟後 Wi-Fi 裝置要等 Bonjour 重新探索完才會回來，比 USB 慢，所以指令會等到有裝置
-出現才回報（最多約 20 秒）。要是等完還是 0 台，通常是裝置那邊沒開「在 Wi-Fi 上顯示
-這部裝置」——那個開關只能用傳輸線接上後在 Finder 裡勾，光是連同一個 Wi-Fi 不夠。
 
 ## 設定
 

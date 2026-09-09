@@ -3,11 +3,8 @@ from __future__ import annotations
 import html
 import json
 import os
-import plistlib
 import re
-import socket
 import sqlite3
-import struct
 import subprocess
 import sys
 import time
@@ -396,21 +393,8 @@ def suggest_alternate_account(
 
 # ------------------------------------------------------------------- 報表
 
-SEV_USBMUXD = "🔌 usbmuxd 異常"
-SEV_EXPIRED = "🔴 已過期"
-SEV_FAILED = "❌ 刷新失敗"
-SEV_OVERDUE = "⚠ 逾期未刷新"
-SEV_DEVICE_OFFLINE = "📵 裝置離線"
-
-# 問題區塊由重到輕排序。usbmuxd 擺第一：它一壞，下面的「裝置離線」全都是它的
-# 下游結果，先看到它才不會跑去修錯的東西（重啟 daemon 對它完全沒用）。
-SEVERITY_ORDER = [
-    SEV_USBMUXD,
-    SEV_EXPIRED,
-    SEV_FAILED,
-    SEV_OVERDUE,
-    SEV_DEVICE_OFFLINE,
-]
+# 問題區塊由重到輕排序。
+SEVERITY_ORDER = ["🔴 已過期", "❌ 刷新失敗", "⚠ 逾期未刷新", "📵 裝置離線"]
 
 
 def short_apple_id(apple_id: str | None) -> str:
@@ -447,17 +431,17 @@ def build_status_report() -> str:
 
     for inst in installs:
         if inst.expired:
-            problems.setdefault(SEV_EXPIRED, []).append(
+            problems.setdefault(SEVERITY_ORDER[0], []).append(
                 f"{inst.label}：{inst.expiry_short()}"
             )
             markers[inst.id] = "🔴"
         elif inst.overdue:
-            problems.setdefault(SEV_OVERDUE, []).append(
+            problems.setdefault(SEVERITY_ORDER[2], []).append(
                 f"{inst.label}：{inst.expiry_short()}"
             )
             markers[inst.id] = "⚠"
         if inst.failing:
-            problems.setdefault(SEV_FAILED, []).append(
+            problems.setdefault(SEVERITY_ORDER[1], []).append(
                 f"{inst.label}：{inst.last_error or '未知錯誤'}"
                 f"（{inst.failures_count} 次）"
             )
@@ -468,22 +452,14 @@ def build_status_report() -> str:
         # 只有「有 app 在跑」的裝置離線才算問題，閒置裝置離線不算——但下面的
         # 表格仍會把它列出來，這是 /devices 併進來之後唯一還看得到它的地方。
         if device and device.offline:
-            problems.setdefault(SEV_DEVICE_OFFLINE, []).append(
+            problems.setdefault(SEVERITY_ORDER[3], []).append(
                 f"{device.name}：最後連線 {device.seen_text()}"
             )
-
-    # 上面那串「裝置離線」有可能全都是 usbmuxd 卡死的下游結果。問一下它，是的話
-    # 就把真正的兇手擺到最前面——否則看到滿螢幕裝置離線，只會跑去重啟 daemon，
-    # 而那對這種狀況完全沒用。
-    usbmux_issue, _ = usbmux_health(len(devices))
-    if usbmux_issue:
-        problems.setdefault(SEV_USBMUXD, []).append(usbmux_issue)
-        problems[SEV_USBMUXD].append("重啟 daemon 沒用，要用 /usbmuxd 重啟它")
 
     lines = []
     if problems:
         count = sum(len(v) for v in problems.values())
-        severe = any(h in problems for h in (SEV_USBMUXD, SEV_EXPIRED, SEV_FAILED))
+        severe = SEVERITY_ORDER[0] in problems or SEVERITY_ORDER[1] in problems
         lines.append(f"{'🔴' if severe else '⚠'} {count} 個問題")
         lines.append("")
         for heading in SEVERITY_ORDER:
@@ -678,154 +654,3 @@ def perform_restart(verify: bool = True) -> tuple[bool, str]:
     return False, (
         f"已送出重啟指令，但 daemon 沒回到 running（state={daemon_state()}）"
     )
-
-
-# ---------------------------------------------------------------- usbmuxd
-
-def _recv_exactly(sock: socket.socket, size: int) -> bytes | None:
-    """收滿 size 個 byte，對方先斷線就回 None。"""
-    if size < 0:
-        return None
-    buf = b""
-    while len(buf) < size:
-        chunk = sock.recv(size - len(buf))
-        if not chunk:
-            return None
-        buf += chunk
-    return buf
-
-
-def usbmux_list_devices() -> list[dict] | None:
-    """問 usbmuxd 現在看得到哪些 iOS 裝置。
-
-    回 None 是「連不上或講不通」，回 [] 是「連得上，但它真的說一台都沒有」——
-    後者正是卡死的樣子，兩者一定要分開。
-    """
-    request = plistlib.dumps(
-        {
-            "MessageType": "ListDevices",
-            "ClientVersionString": config.USBMUXD_CLIENT_NAME,
-            "ProgName": config.USBMUXD_CLIENT_NAME,
-            # 低於 3 的話 usbmuxd 只會回 USB 裝置，Wi-Fi 的一律看不到。
-            "kLibUSBMuxVersion": 3,
-        }
-    )
-    # 表頭是 4 個小端 uint32：總長度、協定版本 1、訊息類型 8（plist）、tag。
-    header = struct.pack("<IIII", 16 + len(request), 1, 8, 1)
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.settimeout(config.USBMUXD_TIMEOUT_SECONDS)
-            sock.connect(config.USBMUXD_SOCKET)
-            sock.sendall(header + request)
-            reply_header = _recv_exactly(sock, 16)
-            if reply_header is None:
-                return None
-            payload = _recv_exactly(sock, struct.unpack("<I", reply_header[:4])[0] - 16)
-        if payload is None:
-            return None
-        return plistlib.loads(payload).get("DeviceList", [])
-    except (OSError, ValueError, struct.error, plistlib.InvalidFileException):
-        return None
-
-
-def usbmux_pid() -> int | None:
-    result = subprocess.run(
-        ["pgrep", "-x", config.USBMUXD_PROCESS_NAME], capture_output=True, text=True
-    )
-    pids = result.stdout.split() if result.returncode == 0 else []
-    return int(pids[0]) if pids else None
-
-
-def describe_usbmux_devices(devices: list[dict]) -> str:
-    """把 usbmuxd 回的裝置清單講成人話，UDID 盡量換成 Sideloadly 裡的名字。"""
-    if not devices:
-        return "目前看到 0 台裝置"
-    try:
-        names = {d.udid: d.name for d in fetch_devices()}
-    except (sqlite3.Error, OSError):
-        names = {}
-    labels = []
-    for device in devices:
-        props = device.get("Properties", {})
-        udid = props.get("SerialNumber") or ""
-        kind = "USB" if props.get("ConnectionType") == "USB" else "Wi-Fi"
-        labels.append(f"{names.get(udid) or udid[:8] or '未知裝置'}（{kind}）")
-    return f"目前看到 {len(devices)} 台裝置：" + "、".join(labels)
-
-
-def usbmux_health(known_device_count: int) -> tuple[str | None, list[dict] | None]:
-    """usbmuxd 現在健不健康。回 (問題描述或 None, 它回報的裝置清單或 None)。
-
-    只問一次 socket，讓 /status 和 monitor 共用同一份判斷——兩邊講的話不一致
-    的話，人只會更困惑。
-    """
-    devices = usbmux_list_devices()
-    if devices is None:
-        return "連不上 usbmuxd（負責探索裝置的系統服務，可能沒在跑）", None
-    if not devices and known_device_count >= config.USBMUXD_MIN_DEVICES_FOR_ALERT:
-        return (
-            f"usbmuxd 還活著，但一台裝置都看不到"
-            f"（Sideloadly 在冊 {known_device_count} 台）",
-            devices,
-        )
-    return None, devices
-
-
-def perform_usbmuxd_restart() -> tuple[bool, str]:
-    """砍掉 usbmuxd 讓 launchd 重新拉起來，再確認它真的開始回報裝置。
-
-    只砍不重開是故意的：這個服務設了 KeepAlive，launchd 會自己補上來，這也是
-    唯一不必知道它在 launchd 裡叫什麼名字的做法（macOS 26 已經沒有對應的
-    plist 檔可以查了）。
-    """
-    old_pid = usbmux_pid()
-    result = subprocess.run(
-        ["sudo", "-n", "/usr/bin/pkill", "-x", config.USBMUXD_PROCESS_NAME],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        # sudo 沒過（沒裝 NOPASSWD 規則）和 pkill 沒砍到東西都是 exit 1，只能靠
-        # stderr 分辨：pkill 找不到行程時是安靜的，sudo 一定會抱怨。
-        stderr = result.stderr.strip()
-        if stderr:
-            if "sudo" in stderr.lower() or "password" in stderr.lower():
-                return False, (
-                    "沒有免密碼 sudo 權限，不能重啟 usbmuxd。\n"
-                    "請在 Mac 上執行一次（會問你的登入密碼）：\n\n"
-                    f"echo '{config.SUDOERS_RULE}' | "
-                    f"sudo tee {config.SUDOERS_PATH} && "
-                    f"sudo chmod 440 {config.SUDOERS_PATH}"
-                )
-            return False, stderr
-        if old_pid is not None:
-            # 它明明還在跑，pkill 卻說沒砍到——這種矛盾不該默默往下走。
-            return False, f"pkill 沒有砍到 usbmuxd（pid {old_pid}），狀態不明。"
-        # usbmuxd 本來就沒在跑，繼續往下等 launchd 把它拉起來。
-
-    restarted = None
-    for _ in range(config.USBMUXD_VERIFY_ATTEMPTS):
-        time.sleep(config.USBMUXD_VERIFY_INTERVAL_SECONDS)
-        new_pid = usbmux_pid()
-        if new_pid is None or new_pid == old_pid:
-            continue  # launchd 還沒把它拉回來
-        devices = usbmux_list_devices()
-        if devices is None:
-            continue  # 起來了但還沒開始接受連線
-        restarted = (new_pid, devices)
-        if devices:
-            break  # 裝置已經回來了，不用再等滿
-
-    if restarted is None:
-        return False, (
-            "已送出重啟指令，但 usbmuxd 沒有在時限內回到可以回答的狀態。"
-        )
-
-    new_pid, devices = restarted
-    summary = f"usbmuxd 已重啟（pid {old_pid} → {new_pid}），{describe_usbmux_devices(devices)}"
-    if not devices:
-        summary += (
-            "。\nWi-Fi 裝置要等 Bonjour 重新探索，再等一下用 /status 看看；"
-            "還是 0 台的話，代表裝置那邊沒開「在 Wi-Fi 上顯示」，得先用線接一次。"
-        )
-    return True, summary

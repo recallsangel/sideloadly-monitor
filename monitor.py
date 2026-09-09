@@ -55,7 +55,6 @@ def main():
 
     refreshed, failed, recovered, overdue, expired = [], [], [], [], []
     offline, back_online = [], []
-    usbmux_broken, usbmux_fixed = [], []
 
     for inst in installs:
         prev = state["installations"].get(inst.id, {})
@@ -133,30 +132,12 @@ def main():
             history.record("device_online", device.name)
             state["device_offline_notified"].pop(device.udid, None)
 
-    # usbmuxd 卡死時所有裝置會同時消失，而重啟 Sideloadly daemon 對它沒有用。
-    # 只報「裝置離線」會把人引去修錯的東西，所以這裡直接點名兇手。跟逾期/離線
-    # 一樣每天最多提醒一次，恢復時再報一次。
-    usbmux_issue, usbmux_devices = common.usbmux_health(len(devices))
-    if usbmux_issue:
-        if state.get("usbmuxd_notified") != today:
-            usbmux_broken.append(f"  · {usbmux_issue}")
-            usbmux_broken.append("    重啟 daemon 沒用，請用 /usbmuxd 重啟它")
-            history.record("usbmuxd_stuck", detail=usbmux_issue)
-            state["usbmuxd_notified"] = today
-    elif state.get("usbmuxd_notified"):
-        summary = common.describe_usbmux_devices(usbmux_devices or [])
-        usbmux_fixed.append(f"  · {summary}")
-        history.record("usbmuxd_ok", detail=summary)
-        state.pop("usbmuxd_notified", None)
-
     save_state(state)
 
     if first_run:
         return
 
     sections = [
-        # usbmuxd 擺第一：底下的「裝置離線」很可能全是它的下游結果。
-        ("🔌 usbmuxd 異常", usbmux_broken),
         ("🔴 已過期", expired),
         ("❌ 刷新失敗", failed),
         ("⚠ 逾期未刷新", overdue),
@@ -164,7 +145,6 @@ def main():
         ("✅ 刷新完成", refreshed),
         ("🔄 錯誤已解除", recovered),
         ("📶 裝置回線", back_online),
-        ("🔌 usbmuxd 恢復", usbmux_fixed),
     ]
     body = []
     for title, items in sections:
