@@ -214,11 +214,61 @@ class Install:
 
     @property
     def failing(self) -> bool:
+        """這一列上有錯誤紀錄。
+
+        不等於「現在正在失敗」——Sideloadly 要到下一次刷新成功才會清掉它，所以
+        旗標會一路亮到下一個刷新窗口。要問「現在還在失敗嗎」用 failing_now。
+        告警與「錯誤已解除」的判定要的是這個原始事實，不是 failing_now。
+        """
         return bool(self.last_error) or self.failures_count > 0
+
+    @property
+    def failure_age_hours(self) -> float | None:
+        """距最後一次失敗多久。None = 沒有時間戳（沒失敗過，或 sideloadly 沒寫）。"""
+        return age_hours(self.last_failure_at)
+
+    @property
+    def stale_failure(self) -> bool:
+        """舊帳：旗標還亮著，但沒有證據顯示現在還在失敗。
+
+        daemon 每分鐘 tick 一次，真的卡在重試的話 last_failure_at 會一直被推新；
+        它不動，表示 daemon 根本沒在重試，重啟也不會讓它重試。
+        """
+        if not self.failing:
+            return False
+        # 失敗之後又刷新成功了。Sideloadly 這時本來就該清掉旗標，這裡不依賴它做到。
+        if (
+            self.last_updated
+            and self.last_failure_at
+            and self.last_updated > self.last_failure_at
+        ):
+            return True
+        age = self.failure_age_hours
+        # 沒有時間戳就沒有「現在還在失敗」的證據，當舊帳處理。monitor 的告警與
+        # /status 仍然看得到這個錯誤，只是不會拿它當重啟的理由。
+        if age is None:
+            return True
+        return age > config.FAILURE_STALE_HOURS
+
+    @property
+    def failing_now(self) -> bool:
+        """重啟 daemon 有機會幫上忙的那一種失敗：最近還在發生。"""
+        return self.failing and not self.stale_failure
 
     @property
     def label(self) -> str:
         return f"{self.device_name} - {self.app_name}"
+
+    def failure_text(self) -> str:
+        """錯誤內容加上它有多舊。同一個旗標會亮到下一次刷新成功為止，少了時間
+        就分不出「剛剛還在失敗」跟「兩天前的舊帳」。"""
+        text = f"{self.last_error or '未知錯誤'}（{self.failures_count} 次"
+        age = self.failure_age_hours
+        if age is not None:
+            text += f"，{human_delta(age * 3600)}前"
+        if self.stale_failure:
+            text += "，等下次刷新才會清"
+        return text + "）"
 
     def expiry_text(self) -> str:
         """通知用的完整說法。"""
@@ -442,8 +492,7 @@ def build_status_report() -> str:
             markers[inst.id] = "⚠"
         if inst.failing:
             problems.setdefault(SEVERITY_ORDER[1], []).append(
-                f"{inst.label}：{inst.last_error or '未知錯誤'}"
-                f"（{inst.failures_count} 次）"
+                f"{inst.label}：{inst.failure_text()}"
             )
             markers[inst.id] = "❌"
 
@@ -551,7 +600,12 @@ def build_status_report() -> str:
 def status_action_keyboard() -> dict | None:
     """有問題的 app 各配一顆按鈕，一鍵發動重新部署——動作其實是重啟整個
     daemon（見 bot.py 的 redeploy 說明），這裡只負責點名是哪個 app 促成的。"""
-    problems = [i for i in visible_installs() if i.expired or i.overdue or i.failing]
+    # failing_now 不是 failing：舊帳按了也沒用，這顆按鈕做的是重啟整顆 daemon，
+    # 而重啟既清不掉錯誤旗標也不會讓刷新提早。真的想手動重來一次仍然可以走
+    # /redeploy，那支列的是全部的 app，不只有問題的那些。
+    problems = [
+        i for i in visible_installs() if i.expired or i.overdue or i.failing_now
+    ]
     if not problems:
         return None
     return {

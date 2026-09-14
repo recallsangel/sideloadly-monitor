@@ -433,5 +433,73 @@ check("歷史紀錄點名是為了哪個 app 觸發的", "為了" in (last_resta
 press("status")
 check("/status 有問題時附帶重新部署按鈕", find_callback("redeploy:") is not None)
 
+# ------------------------------------------- 舊錯誤不該每天觸發重啟
+
+# 2026-09-12 04:58 那筆 Cancelled 讓 09-13 與 09-14 的 04:00 各重啟了一次：
+# Sideloadly 要到下一次刷新成功才會清掉錯誤旗標，而下一次刷新排在 96 小時後，
+# 於是旗標亮著的每一天都變成一個「需要重啟的原因」，而重啟一件都解決不了。
+
+import restart
+
+common.daemon_state = lambda: "running"
+ZERO_TS = "0001-01-01 00:00:00+00:00"
+SENTINEL = "測試用錯誤 xyzzy"
+
+# 先把整批壓成健康狀態：前面幾段留下了過期與逾期的列，它們會自己貢獻重啟理由，
+# 壓掉之後唯一的變數才是那一筆錯誤本身。
+db("UPDATE installations SET last_updated = ?, last_error = '', "
+   "failures_count = 0, last_failure_at = ?", ts(hours=-2), ZERO_TS)
+
+
+def fail_row(failure_at, updated=None):
+    """把 id2 設成一筆失敗，回傳（重啟理由, 舊帳）兩段文字。"""
+    db("UPDATE installations SET last_error = ?, failures_count = 1, "
+       "last_failure_at = ?, last_updated = ? WHERE id = ?",
+       SENTINEL, failure_at, updated or ts(hours=-2), id2)
+    reasons, stale = restart.restart_reasons()
+    return "\n".join(reasons), "\n".join(stale)
+
+
+reasons, stale = fail_row(ts(minutes=-30))
+check("剛發生的失敗算重啟理由", SENTINEL in reasons and SENTINEL not in stale)
+
+reasons, stale = fail_row(ts(hours=-(config.FAILURE_STALE_HOURS + 1)))
+check("超過時效的失敗不再觸發重啟", SENTINEL not in reasons)
+check("超過時效的失敗列進舊帳", SENTINEL in stale)
+
+reasons, stale = fail_row(ts(minutes=-30), updated=ts(minutes=-10))
+check("失敗之後又刷新成功就算舊帳", SENTINEL not in reasons and SENTINEL in stale)
+
+reasons, stale = fail_row(ZERO_TS)
+check("有錯誤卻沒有時間戳時當舊帳", SENTINEL not in reasons and SENTINEL in stale)
+
+# 只剩舊帳時 main() 不能動手——這才是 09-13/09-14 那兩次多餘重啟的出口。
+restarted = []
+common.perform_restart = lambda verify=True: (
+    restarted.append(1) or (True, "已重啟（測試）")
+)
+
+fail_row(ts(hours=-(config.FAILURE_STALE_HOURS + 1)))
+restart.main()
+check("只有舊帳時 main() 不重啟", not restarted)
+
+fail_row(ts(minutes=-30))
+restart.main()
+check("失敗還在發生時 main() 照樣重啟", restarted)
+
+# /status 的重新部署按鈕跟 restart.py 問的是同一件事，不能各答各的。
+fail_row(ts(hours=-(config.FAILURE_STALE_HOURS + 1)))
+check("只有舊帳時 /status 不給重新部署按鈕", common.status_action_keyboard() is None)
+fail_row(ts(minutes=-30))
+check("失敗還在發生時 /status 給得出按鈕", common.status_action_keyboard() is not None)
+
+# 錯誤「變舊」不是「解除」：monitor 讀的必須是原始旗標，否則時效一到就會憑空
+# 推一則「錯誤已解除」，而那時候什麼都還沒解決。
+run("fresh failure")
+db("UPDATE installations SET last_failure_at = ? WHERE id = ?",
+   ts(hours=-(config.FAILURE_STALE_HOURS + 1)), id2)
+check("錯誤變舊不會被誤報成錯誤已解除",
+      "錯誤已解除" not in run("failure ages out"))
+
 shutil.rmtree(TMP, ignore_errors=True)
 print("\n✅ 全部通過")

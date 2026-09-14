@@ -99,6 +99,9 @@ def main():
                         f"    ↳ {inst.apple_id} 本週 App ID 額度已用完，"
                         f"其他已綁定帳號也沒有剩餘額度"
                     )
+        # 這裡讀的是原始的 failing，不是 failing_now：錯誤「變舊」不是「解除」，
+        # 拿 failing_now 比會在旗標放了 FAILURE_STALE_HOURS 之後憑空推一則
+        # 「錯誤已解除」，而那時候什麼都還沒解決。
         elif prev and (prev_error or prev_failures) and not inst.failing:
             recovered.append(f"  · {inst.label}")
             history.record("recovery", inst.device_name, inst.app_name)

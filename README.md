@@ -13,7 +13,7 @@
 | --- | --- | --- |
 | `com.patrickchen.sideloadly-monitor` | 每小時 | `monitor.py` 比對資料庫，把變化彙整成一則通知 |
 | `com.patrickchen.sideloadly-bot` | 常駐 | `bot.py` 處理 Telegram 指令，兼任監控看門狗 |
-| `com.patrickchen.sideloadly-daily-restart` | 每天 04:00 | `restart.py` 只在真有問題時重啟 daemon |
+| `com.patrickchen.sideloadly-daily-restart` | 每天 04:00 | `restart.py` 只在重啟解得掉的問題上動手 |
 
 資料來源是 Sideloadly 自己的 sqlite（**唯讀開啟**，不寫入）：
 `~/Library/Application Support/sideloadly/installations.db`
@@ -32,6 +32,39 @@
   `OVERDUE_GRACE_HOURS` 寬限，避免刷新稍慢就告警
 
 欄位是 0/NULL 時才退回 `config.py` 的 `DEFAULT_*` 預設值。
+
+## 錯誤旗標與「舊帳」
+
+`last_error` / `failures_count` 不等於「現在正在失敗」。Sideloadly 要到**下一次
+刷新成功**才會清掉它們，而下一次刷新排在 `last_updated + refresh_at_hours`
+（目前 96 小時）——一筆失敗的旗標因此會亮好幾天。
+
+這件事咬過一次：2026-09-12 04:58 iPhone Air 的 Instagram 收到一筆 `Cancelled`，
+09-13 與 09-14 的 04:00 各為它重啟了一次 daemon。重啟既清不掉旗標，也不會讓刷新
+提早，所以那兩次什麼都沒解決，只是每天把 daemon 打斷一次——而「不要無條件重啟，
+會打斷正在進行的刷新」正是 `restart.py` 存在的第一個理由。
+
+所以旗標拆成兩個問題（`common.Install`）：
+
+| 屬性 | 問的是 | 誰在讀 |
+| --- | --- | --- |
+| `failing` | 這一列上有錯誤紀錄嗎 | 告警、「錯誤已解除」的判定、`/status` 的 ❌ |
+| `failing_now` | 現在還在失敗嗎（重啟有機會幫上忙） | `restart.py`、`/status` 的重新部署按鈕 |
+
+`failing_now` 就是 `failing` 扣掉 `stale_failure`，而舊帳有三種：失敗距今超過
+`FAILURE_STALE_HOURS`（12 小時）、失敗之後又刷新成功了、有錯誤旗標卻沒有
+`last_failure_at` 可以判斷。
+
+判準的機制：daemon 每分鐘 tick 一次，真的卡在重試的話 `last_failure_at` 會一直被
+推新，`failing_now` 就還是 True；它不動，表示 daemon 根本沒在重試，重啟也不會讓
+它重試。12 小時是兩端夾出來的——窗口不必長（時間戳每分鐘都有機會被推新），但也
+不能短到排除掉 2026-09-08 那次「失敗後約 3.7 小時的重啟真的把它救回來」。
+
+**告警那一側刻意維持讀原始的 `failing`。** 錯誤「變舊」不是「解除」，拿
+`failing_now` 去比會在時效一到時憑空推一則「錯誤已解除」，而那時候什麼都還沒
+解決。`/status` 則照樣列出舊帳，只是把它有多舊一起印出來
+（`Cancelled（1 次，2.3 天前，等下次刷新才會清）`），不會給重新部署按鈕——
+真的想手動重來一次仍然可以走 `/redeploy`，那支列的是全部的 app。
 
 ## 告警項目
 

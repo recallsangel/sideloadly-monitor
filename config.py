@@ -52,6 +52,20 @@ OVERDUE_GRACE_HOURS = 12
 # devices.last_seen 超過這麼久沒更新就視為裝置離線（離線期間刷新一定失敗）。
 DEVICE_OFFLINE_HOURS = 24
 
+# 錯誤旗標還亮著、但 last_failure_at 已經這麼久沒往前動，就當成舊帳而不是
+# 「現在正在失敗」。
+#
+# 為什麼需要這道界線：Sideloadly 要到下一次刷新**成功**才會清掉 last_error /
+# failures_count，而下一次刷新排在 last_updated + refresh_at_hours（目前 96
+# 小時），所以一筆失敗會讓旗標亮好幾天。restart.py 直接讀那個旗標的話，同一筆
+# 舊錯誤會讓 04:00 那支每天重啟一次——而重啟既清不掉旗標，也不會讓刷新提早。
+# 2026-09-13 與 09-14 就是這樣為同一筆 09-12 04:58 的 Cancelled 各重啟了一次。
+#
+# 12 小時是從兩端夾出來的：daemon 每分鐘 tick 一次，真的卡在重試的話這個時間戳
+# 會一直被推新，所以窗口不必長；而 2026-09-08 那次「Cancelled by user」是失敗後
+# 約 3.7 小時的那次重啟救回來的，所以也不能短到把它排除掉。
+FAILURE_STALE_HOURS = 12
+
 # monitor 每小時跑一次；state.json 的 last_run 超過這麼久沒更新，
 # 代表監控自己死了（launchd job 掛掉、Mac 睡著、python 噴錯）。
 HEARTBEAT_STALE_HOURS = 3

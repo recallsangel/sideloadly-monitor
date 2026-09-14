@@ -10,8 +10,16 @@ import common
 import history
 
 
-def restart_reasons() -> list[str]:
+def restart_reasons() -> tuple[list[str], list[str]]:
+    """回傳（重啟解得掉的問題, 解不掉但值得記一筆的舊帳）。
+
+    只有第一份算重啟的理由。錯誤旗標本身不算——Sideloadly 要到下一次刷新成功
+    才會清掉它，而重啟既清不掉旗標也不會讓刷新提早，於是同一筆舊錯誤會讓這支
+    每天 04:00 重啟一次，什麼都沒解決還每天打斷 daemon 一次（restart.py 存在的
+    理由第一句就是不要那樣做）。判準見 common.Install.stale_failure。
+    """
     reasons = []
+    stale = []
 
     state = common.daemon_state()
     if state != "running":
@@ -24,21 +32,28 @@ def restart_reasons() -> list[str]:
             reasons.append(f"{inst.label} {inst.expiry_text()}")
         elif inst.overdue:
             reasons.append(f"{inst.label} 逾期未刷新（{inst.expiry_text()}）")
-        if inst.failing:
+        if inst.failing_now:
             reasons.append(
                 f"{inst.label} 有錯誤：{inst.last_error or '未知'} "
                 f"(failures={inst.failures_count})"
             )
+        elif inst.failing:
+            stale.append(f"{inst.label} 有舊錯誤：{inst.failure_text()}")
 
-    return reasons
+    return reasons, stale
 
 
 def main():
     force = "--force" in sys.argv[1:]
-    reasons = restart_reasons()
+    reasons, stale = restart_reasons()
+
+    # 舊帳只進 log，不推播也不重啟：它沒有變化，而每天為它發一則通知就是把
+    # 「有事發生」的意思磨掉。
+    for item in stale:
+        print(f"（重啟解不掉，略過）{item}")
 
     if not force and not reasons:
-        print("一切正常，不重啟。")
+        print("沒有重啟解得掉的問題，不重啟。" if stale else "一切正常，不重啟。")
         return
 
     if force:
