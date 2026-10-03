@@ -33,10 +33,7 @@ def restart_reasons() -> tuple[list[str], list[str]]:
         elif inst.overdue:
             reasons.append(f"{inst.label} 逾期未刷新（{inst.expiry_text()}）")
         if inst.failing_now:
-            reasons.append(
-                f"{inst.label} 有錯誤：{inst.last_error or '未知'} "
-                f"(failures={inst.failures_count})"
-            )
+            reasons.append(f"{inst.label} 有錯誤：{inst.failure_text()}")
         elif inst.failing:
             stale.append(f"{inst.label} 有舊錯誤：{inst.failure_text()}")
 
@@ -66,8 +63,7 @@ def main():
     ok, message = common.perform_restart()
     print(message)
 
-    detail = "; ".join(reasons) if reasons else "force"
-    history.record("restart", detail=f"{'ok' if ok else 'fail'}: {message} | {detail}")
+    history.record_restart(ok, message, "; ".join(reasons) if reasons else "force")
 
     body = message if force else message + "\n\n原因：\n" + "\n".join(
         f"· {r}" for r in reasons

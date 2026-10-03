@@ -10,20 +10,18 @@ import config
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
-    id      INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts      TEXT NOT NULL,
-    kind    TEXT NOT NULL,
-    device  TEXT,
-    app     TEXT,
-    detail  TEXT
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    device_name TEXT,
+    app_name    TEXT,
+    detail      TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
 CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind);
 """
 
-# kind 一覽：refresh / failure / recovery / overdue / expired
-#            device_offline / device_online / restart / monitor_stale
-
+# 所有 kind 與顯示名稱。
 KIND_LABELS = {
     "refresh": "刷新完成",
     "failure": "刷新失敗",
@@ -44,17 +42,23 @@ def _connect() -> sqlite3.Connection:
     return con
 
 
-def record(kind: str, device: str | None = None, app: str | None = None,
+def record(kind: str, device_name: str | None = None, app_name: str | None = None,
            detail: str | None = None):
     con = _connect()
     try:
         with con:
             con.execute(
-                "INSERT INTO events (ts, kind, device, app, detail) VALUES (?, ?, ?, ?, ?)",
-                (datetime.now(timezone.utc).isoformat(), kind, device, app, detail),
+                "INSERT INTO events (ts, kind, device_name, app_name, detail) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (datetime.now(timezone.utc).isoformat(), kind, device_name, app_name, detail),
             )
     finally:
         con.close()
+
+
+def record_restart(ok: bool, message: str, why: str):
+    """restart.py 與 bot 的重啟記成同一種格式，/log 裡才對照得起來。"""
+    record("restart", detail=f"{'ok' if ok else 'fail'}: {message} | {why}")
 
 
 def recent(limit: int = 15, kinds: list[str] | None = None) -> list[sqlite3.Row]:
@@ -75,17 +79,16 @@ def recent(limit: int = 15, kinds: list[str] | None = None) -> list[sqlite3.Row]
 
 
 def build_log_report(limit: int = 15) -> str:
-    rows = recent(limit, kinds=["failure", "recovery", "overdue", "expired",
-                                "device_offline", "device_online", "restart",
-                                "monitor_stale"])
+    # 刷新完成是例行公事，其他 kind 都算異常。
+    rows = recent(limit, kinds=[kind for kind in KIND_LABELS if kind != "refresh"])
     if not rows:
         return "沒有任何異常紀錄。"
 
     lines = [f"最近 {len(rows)} 筆異常："]
     for row in rows:
         ts = common.parse_ts(row["ts"])
-        when = common.human_delta((datetime.now(timezone.utc) - ts).total_seconds()) + "前" if ts else "?"
-        target = " / ".join(x for x in (row["device"], row["app"]) if x)
+        when = common.ago(ts) if ts else "?"
+        target = " / ".join(x for x in (row["device_name"], row["app_name"]) if x)
         label = KIND_LABELS.get(row["kind"], row["kind"])
         line = f"· {when} {label}"
         if target:
@@ -105,8 +108,8 @@ def build_stats_report(days: int = 7) -> str:
             (since,),
         ).fetchall()
         refreshes = con.execute(
-            "SELECT ts, device, app FROM events WHERE kind = 'refresh' AND ts >= ? "
-            "ORDER BY device, app, ts",
+            "SELECT ts, device_name, app_name FROM events WHERE kind = 'refresh' AND ts >= ? "
+            "ORDER BY device_name, app_name, ts",
             (since,),
         ).fetchall()
     finally:
@@ -118,13 +121,13 @@ def build_stats_report(days: int = 7) -> str:
     lines = [f"最近 {days} 天統計："]
     for row in counts:
         label = KIND_LABELS.get(row["kind"], row["kind"])
-        lines.append(f"  {label}: {row['n']} 次")
+        lines.append(f"  {label}：{row['n']} 次")
 
     # 每個 app 連續兩次刷新之間的平均間隔。
     gaps: dict[tuple[str, str], list[float]] = {}
     previous: dict[tuple[str, str], datetime] = {}
     for row in refreshes:
-        key = (row["device"] or "?", row["app"] or "?")
+        key = (row["device_name"] or "?", row["app_name"] or "?")
         ts = common.parse_ts(row["ts"])
         if ts is None:
             continue
@@ -135,10 +138,11 @@ def build_stats_report(days: int = 7) -> str:
     if gaps:
         lines.append("")
         lines.append("平均刷新間隔：")
-        for (device, app), values in sorted(gaps.items()):
+        for (device_name, app_name), values in sorted(gaps.items()):
             avg = sum(values) / len(values)
             lines.append(
-                f"  {device} - {app}: {common.human_delta(avg)}（{len(values)} 次間隔）"
+                f"  {device_name} - {app_name}：{common.human_delta(avg)}"
+                f"（{len(values)} 次間隔）"
             )
 
     return "\n".join(lines)

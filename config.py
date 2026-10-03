@@ -35,11 +35,12 @@ LOW_QUOTA_THRESHOLD = 2
 STATE_PATH = PROJECT_DIR / "state.json"
 BOT_OFFSET_PATH = PROJECT_DIR / "bot_offset.txt"
 EVENTS_DB_PATH = PROJECT_DIR / "events.db"
-MUTE_PATH = PROJECT_DIR / "mute_until.txt"
-# /forget 忘記的裝置/app 清單，見 ignore.py。跟 installations.db 無關，純粹是本專案
+MUTE_UNTIL_PATH = PROJECT_DIR / "mute_until.txt"
+# /forget 忘記的裝置/app 清單，見 forget.py。跟 installations.db 無關，純粹是本專案
 # 自己的「不想再看到」名單，過濾發生在讀出來之後那一層。
-IGNORED_PATH = PROJECT_DIR / "ignored.json"
-RESTART_LABEL = "io.sideloadly.daemon"
+FORGOTTEN_PATH = PROJECT_DIR / "forgotten.json"
+# Sideloadly daemon 的 launchd label，查狀態（daemon_state）和重啟都靠它。
+DAEMON_LABEL = "io.sideloadly.daemon"
 
 # 過期判定改用 installations 表的 known_ttl（憑證有效天數）與 refresh_at_hours
 # （sideloadly 自己認為該刷新的時數）。這兩個欄位是 0/NULL 時才退回下列預設。

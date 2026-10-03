@@ -12,34 +12,6 @@ import config
 import history
 
 
-def load_state() -> dict:
-    if config.STATE_PATH.exists():
-        state = json.loads(config.STATE_PATH.read_text())
-    else:
-        state = {}
-    state.setdefault("installations", {})
-    state.setdefault("overdue_notified", {})
-    state.setdefault("expired_notified", {})
-    state.setdefault("device_offline_notified", {})
-    # 舊版把值存成單一 last_updated 字串，且用的是 DB 原始格式
-    # （"2026-08-22 17:29:37.53582+08:00"）。這裡一併轉成 dict 與 isoformat，
-    # 否則升級後第一輪會因格式不同而把每個 app 都誤判成剛刷新。
-    for iid, entry in list(state["installations"].items()):
-        if isinstance(entry, str):
-            ts = common.parse_ts(entry)
-            state["installations"][iid] = {
-                "last_updated": ts.isoformat() if ts else None,
-                "failures": 0,
-                "error": None,
-            }
-    return state
-
-
-def save_state(state: dict):
-    state["last_run"] = datetime.now(timezone.utc).isoformat()
-    config.STATE_PATH.write_text(json.dumps(state, indent=2, ensure_ascii=False))
-
-
 def main():
     if not config.SIDELOADLY_DB_PATH.exists():
         return
@@ -50,8 +22,16 @@ def main():
     if rotated:
         print(rotated, flush=True)
 
-    state = load_state()
-    first_run = not state["installations"]
+    prev_state = (
+        json.loads(config.STATE_PATH.read_text()) if config.STATE_PATH.exists() else {}
+    )
+    # 看 last_run 而不是看上輪有沒有 app：app 全被刪掉或忘記時快照會一直是空的，
+    # 那樣每一輪都會被當成第一次，連裝置離線都不會推。
+    first_run = "last_run" not in prev_state
+    prev_installs = prev_state.get("installs", {})
+    prev_overdue = prev_state.get("overdue_notified", {})
+    prev_expired = prev_state.get("expired_notified", {})
+    prev_offline = prev_state.get("device_offline_notified", {})
     today = datetime.now(timezone.utc).date().isoformat()
 
     # 用 visible_* 而不是 fetch_*：被 /forget 忘記的裝置/app 不該再觸發告警。
@@ -61,35 +41,36 @@ def main():
 
     refreshed, failed, recovered, overdue, expired = [], [], [], [], []
     offline, back_online = [], []
+    # 新的 state 每輪從頭建，資料庫裡已經沒有（或被忘記）的 app 與裝置就不會留下來。
+    # 留著的話快照只會一直累積，Sideloadly 重用 id 時還會把新 app 誤判成刷新完成。
+    snapshot, overdue_notified, expired_notified, device_offline_notified = {}, {}, {}, {}
 
     for inst in installs:
-        prev = state["installations"].get(inst.id, {})
-        prev_updated = prev.get("last_updated")
-        prev_failures = prev.get("failures", 0)
-        prev_error = prev.get("error")
+        prev = prev_installs.get(inst.id, {})
+        last_updated = inst.last_updated.isoformat() if inst.last_updated else None
 
-        raw_updated = inst.last_updated.isoformat() if inst.last_updated else None
-
-        if prev and raw_updated != prev_updated:
-            refreshed.append(f"  · {inst.label} ({inst.expiry_text()})")
+        if prev and last_updated != prev.get("last_updated"):
+            refreshed.append(f"  · {inst.label}（{inst.expiry_text()}）")
             history.record("refresh", inst.device_name, inst.app_name, inst.version)
 
-        new_failure = inst.failures_count > prev_failures or (
-            inst.last_error and inst.last_error != prev_error
+        new_failure = inst.failures_count > prev.get("failures_count", 0) or (
+            inst.last_error and inst.last_error != prev.get("last_error")
         )
         if prev and new_failure:
-            failed.append(
-                f"  · {inst.label}: {inst.last_error or '未知錯誤'} "
-                f"(failures={inst.failures_count})"
-            )
+            failed.append(f"  · {inst.label}：{inst.failure_text()}")
             history.record("failure", inst.device_name, inst.app_name, inst.last_error)
 
-            # apple_id 額度用完是常見的假期到——見不到明確錯誤訊息分類，
-            # 只能拿 App ID 週配額當旁證，附一個「可以換這個帳號試試」的提示。
-            current_quota = quotas.get(inst.apple_id) if inst.apple_id else None
-            if inst.apple_id and current_quota is not None and current_quota.remaining <= 0:
-                alt = common.suggest_alternate_account(inst.apple_id, quotas)
-                if alt:
+            # App ID 額度用完是失敗的常見原因之一，但 Sideloadly 沒公開失敗原因的
+            # 分類，只能拿週配額當旁證，附一個「可以換這個帳號試試」的提示——
+            # 是提示，不是診斷。
+            quota = quotas.get(inst.apple_id)
+            if quota is not None and quota.remaining <= 0:
+                alternates = [
+                    q for q in quotas.values()
+                    if q.apple_id != inst.apple_id and q.remaining > 0
+                ]
+                if alternates:
+                    alt = max(alternates, key=lambda q: q.remaining)
                     failed.append(
                         f"    ↳ {inst.apple_id} 本週 App ID 額度已用完，"
                         f"可試著切到 {alt.apple_id}（剩 {alt.remaining} 個）"
@@ -102,55 +83,60 @@ def main():
         # 這裡讀的是原始的 failing，不是 failing_now：錯誤「變舊」不是「解除」，
         # 拿 failing_now 比會在旗標放了 FAILURE_STALE_HOURS 之後憑空推一則
         # 「錯誤已解除」，而那時候什麼都還沒解決。
-        elif prev and (prev_error or prev_failures) and not inst.failing:
+        elif prev and (prev.get("last_error") or prev.get("failures_count")) and not inst.failing:
             recovered.append(f"  · {inst.label}")
             history.record("recovery", inst.device_name, inst.app_name)
 
-        state["installations"][inst.id] = {
-            "last_updated": raw_updated,
-            "failures": inst.failures_count,
-            "error": inst.last_error,
+        snapshot[inst.id] = {
+            "last_updated": last_updated,
+            "failures_count": inst.failures_count,
+            "last_error": inst.last_error,
         }
 
         # 逾期／過期每天最多提醒一次。
         if inst.expired:
-            if state["expired_notified"].get(inst.id) != today:
-                expired.append(f"  · {inst.label}: {inst.expiry_text()}")
+            expired_notified[inst.id] = today
+            if prev_expired.get(inst.id) != today:
+                expired.append(f"  · {inst.label}：{inst.expiry_text()}")
                 history.record("expired", inst.device_name, inst.app_name, inst.expiry_text())
-                state["expired_notified"][inst.id] = today
-        else:
-            state["expired_notified"].pop(inst.id, None)
-
-        if inst.overdue and not inst.expired:
-            if state["overdue_notified"].get(inst.id) != today:
-                overdue.append(f"  · {inst.label}: {inst.expiry_text()}")
+        elif inst.overdue:
+            overdue_notified[inst.id] = today
+            if prev_overdue.get(inst.id) != today:
+                overdue.append(f"  · {inst.label}：{inst.expiry_text()}")
                 history.record("overdue", inst.device_name, inst.app_name, inst.expiry_text())
-                state["overdue_notified"][inst.id] = today
-        else:
-            state["overdue_notified"].pop(inst.id, None)
 
     for device in devices:
-        was_offline = device.udid in state["device_offline_notified"]
         if device.offline:
-            if state["device_offline_notified"].get(device.udid) != today:
-                offline.append(f"  · {device.name}: 最後連線 {device.seen_text()}")
+            device_offline_notified[device.udid] = today
+            if prev_offline.get(device.udid) != today:
+                offline.append(f"  · {device.name}：最後連線 {device.seen_text()}")
                 history.record("device_offline", device.name, detail=device.seen_text())
-                state["device_offline_notified"][device.udid] = today
-        elif was_offline:
+        elif device.udid in prev_offline:
             back_online.append(f"  · {device.name}")
             history.record("device_online", device.name)
-            state["device_offline_notified"].pop(device.udid, None)
 
-    save_state(state)
+    config.STATE_PATH.write_text(
+        json.dumps(
+            {
+                "installs": snapshot,
+                "overdue_notified": overdue_notified,
+                "expired_notified": expired_notified,
+                "device_offline_notified": device_offline_notified,
+                "last_run": datetime.now(timezone.utc).isoformat(),
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
 
     if first_run:
         return
 
     sections = [
-        ("🔴 已過期", expired),
-        ("❌ 刷新失敗", failed),
-        ("⚠ 逾期未刷新", overdue),
-        ("📵 裝置離線", offline),
+        (common.EXPIRED_HEADING, expired),
+        (common.FAILING_HEADING, failed),
+        (common.OVERDUE_HEADING, overdue),
+        (common.OFFLINE_HEADING, offline),
         ("✅ 刷新完成", refreshed),
         ("🔄 錯誤已解除", recovered),
         ("📶 裝置回線", back_online),

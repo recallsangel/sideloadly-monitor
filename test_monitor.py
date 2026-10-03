@@ -28,16 +28,16 @@ shutil.copy(REAL_DB, DB)
 config.SIDELOADLY_DB_PATH = DB
 config.STATE_PATH = TMP / "state.json"
 config.EVENTS_DB_PATH = TMP / "events.db"
-config.MUTE_PATH = TMP / "mute_until.txt"
-config.IGNORED_PATH = TMP / "ignored.json"
+config.MUTE_UNTIL_PATH = TMP / "mute_until.txt"
+config.FORGOTTEN_PATH = TMP / "forgotten.json"
 # monitor.main() 每輪都會輪替 daemon 日誌，所以這條路徑在整份測試裡都不能指到
 # 真實檔案——只在用到的那一段才導開是不夠的：那之後還有十幾次 monitor.main()。
 config.DAEMON_LOG_PATH = TMP / "daemon.err.log"
 
 import bot
 import common
+import forget
 import history
-import ignore
 import monitor
 
 SENT: list[dict] = []
@@ -155,6 +155,17 @@ body = run("recovery")
 check("偵測到錯誤解除", "錯誤已解除" in body)
 check("偵測到裝置回線", "裝置回線" in body)
 
+# 資料庫裡已經沒有的 app 要從 state.json 清掉：留著的話快照只會一直累積，
+# Sideloadly 重用 id 時還會把新 app 誤判成「刷新完成」。
+state = json.loads(config.STATE_PATH.read_text())
+state["installs"]["999999"] = {"last_updated": None, "failures_count": 0, "last_error": None}
+state["expired_notified"]["999999"] = "2000-01-01"
+config.STATE_PATH.write_text(json.dumps(state))
+check("清理不存在的 app 本身不推送", not run("stale ids"))
+state = json.loads(config.STATE_PATH.read_text())
+check("state.json 清掉資料庫裡已經沒有的 app",
+      "999999" not in state["installs"] and "999999" not in state["expired_notified"])
+
 # --------------------------------------------------- daemon 日誌輪替
 
 # 路徑在檔案最上面就導到 TMP 了，這裡只要把門檻縮小到測得動的尺寸，
@@ -199,23 +210,11 @@ check("靜音期間不推送", not run("muted"))
 check("靜音期間仍寫入歷史", len(history.recent(200)) > before)
 common.clear_mute()
 
-# ------------------------------------------------------- 舊版 state 格式遷移
-
-# 舊版把 last_updated 存成 DB 原始字串，新版存 isoformat。遷移沒處理好，
-# 升級後第一輪會把每個 app 都誤判成剛刷新。
-con = sqlite3.connect(DB)
-raw = {str(i): u for i, u in con.execute("SELECT id, last_updated FROM installations")}
-con.close()
-config.STATE_PATH.write_text(json.dumps(
-    {"installations": raw, "overdue_notified": {}}, ensure_ascii=False))
-check("舊版 state 遷移不誤報刷新", "刷新完成" not in run("legacy state"))
-
 # ------------------------------------------------------------------- 心跳
 
 
 def set_last_run(**kw):
     config.STATE_PATH.write_text(json.dumps({
-        "installations": {},
         "last_run": (datetime.now(timezone.utc) + timedelta(**kw)).isoformat(),
     }))
 
@@ -237,7 +236,8 @@ check("偵測到 monitor 恢復", "恢復" in sent_text())
 # ------------------------------------------------------------------- 報表
 
 for name, fn in (("/status", common.build_status_report),
-                 ("/forgotten", common.build_ignored_report),
+                 ("/accounts", common.build_account_report),
+                 ("/forgotten", common.build_forgotten_report),
                  ("/log", history.build_log_report),
                  ("/stats", history.build_stats_report)):
     output = fn()
@@ -289,7 +289,7 @@ def say(text: str):
     })
 
 
-common.perform_restart = lambda verify=True: (True, "已重啟（測試）")
+common.perform_restart = lambda: (True, "已重啟（測試）")
 
 say("/menu")
 check("/menu 送出選單", "選單" in sent_text())
@@ -314,8 +314,15 @@ check("文字指令也走確認流程", "確定要重啟" in sent_text())
 say("/confirm")
 check("/confirm 仍可用", "已重啟" in sent_text())
 
-press("mute:8")
-check("按鈕可靜音", "已靜音 8 小時" in sent_text())
+# 取消不能只是換回選單：舊訊息上的「確定重啟」還按得到。
+press("restart")
+press("restart:cancel")
+check("按取消有確認訊息", "已取消重啟" in sent_text())
+press("restart:go")
+check("取消後舊的確定按鈕不會重啟", "已重啟" not in sent_text())
+
+press("mute")
+check("按鈕可靜音", f"已靜音 {bot.DEFAULT_MUTE_HOURS} 小時" in sent_text())
 press("unmute")
 check("按鈕可解除靜音", "已解除靜音" in sent_text())
 common.clear_mute()
@@ -356,8 +363,8 @@ def find_callback(prefix: str) -> str | None:
 target_device = common.fetch_devices()[0]
 
 check("重複忘記同一台裝置第二次回 False（不重複寫入）",
-      ignore.ignore_device(target_device.udid, target_device.name)
-      and not ignore.ignore_device(target_device.udid, target_device.name))
+      forget.forget_device(target_device.udid, target_device.name)
+      and not forget.forget_device(target_device.udid, target_device.name))
 check("忘記裝置後唯讀來源 fetch_devices 不受影響（不寫 Sideloadly 的 DB）",
       any(d.udid == target_device.udid for d in common.fetch_devices()))
 check("忘記裝置後 visible_devices 看不到它",
@@ -367,12 +374,12 @@ check("忘記裝置後 visible_installs 連帶看不到它底下的 app",
 check("忘記裝置後 /status 報表不再提到它",
       target_device.name not in common.build_status_report())
 
-ignore.unignore_device(target_device.udid)
+forget.unforget_device(target_device.udid)
 check("復原後 visible_devices 恢復看得到",
       any(d.udid == target_device.udid for d in common.visible_devices()))
 
 target_install = common.fetch_installs()[0]
-ignore.ignore_install(target_install.device_udid, target_install.device_name, target_install.app_name)
+forget.forget_install(target_install.device_udid, target_install.device_name, target_install.app_name)
 check("忘記單一 app 後 visible_installs 看不到它",
       not any(i.id == target_install.id for i in common.visible_installs()))
 other_installs_same_device = [
@@ -386,7 +393,7 @@ check("忘記單一 app 不影響同裝置上的其他 app",
           any(v.id == other.id for v in common.visible_installs())
           for other in other_installs_same_device
       ))
-ignore.unignore_install(target_install.device_udid, target_install.app_name)
+forget.unforget_install(target_install.device_udid, target_install.app_name)
 check("復原後 visible_installs 恢復看得到",
       any(i.id == target_install.id for i in common.visible_installs()))
 
@@ -475,7 +482,7 @@ check("有錯誤卻沒有時間戳時當舊帳", SENTINEL not in reasons and SEN
 
 # 只剩舊帳時 main() 不能動手——這才是 09-13/09-14 那兩次多餘重啟的出口。
 restarted = []
-common.perform_restart = lambda verify=True: (
+common.perform_restart = lambda: (
     restarted.append(1) or (True, "已重啟（測試）")
 )
 
@@ -500,6 +507,16 @@ db("UPDATE installations SET last_failure_at = ? WHERE id = ?",
    ts(hours=-(config.FAILURE_STALE_HOURS + 1)), id2)
 check("錯誤變舊不會被誤報成錯誤已解除",
       "錯誤已解除" not in run("failure ages out"))
+
+# ------------------------------------------- 沒有任何 app 時照樣要推送
+
+# 首次執行的判斷原本看「上輪快照有沒有 app」：app 全被刪掉或忘記時快照一直是空的，
+# 每一輪都被當成首次執行，連裝置離線都推不出來。
+for inst in common.fetch_installs():
+    forget.forget_install(inst.device_udid, inst.device_name, inst.app_name)
+run("all apps forgotten")
+db("UPDATE devices SET last_seen = ? WHERE udid = ?", ts(days=-3), OFFLINE_UDID)
+check("沒有任何 app 時裝置離線仍會推送", "裝置離線" in run("offline without apps"))
 
 shutil.rmtree(TMP, ignore_errors=True)
 print("\n✅ 全部通過")

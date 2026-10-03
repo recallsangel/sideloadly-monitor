@@ -11,9 +11,9 @@
 
 | Job | 頻率 | 做什麼 |
 | --- | --- | --- |
-| `com.patrickchen.sideloadly-monitor` | 每小時 | `monitor.py` 比對資料庫，把變化彙整成一則通知 |
-| `com.patrickchen.sideloadly-bot` | 常駐 | `bot.py` 處理 Telegram 指令，兼任監控看門狗 |
-| `com.patrickchen.sideloadly-daily-restart` | 每天 04:00 | `restart.py` 只在重啟解得掉的問題上動手 |
+| `com.example.sideloadly-monitor` | 每小時 | `monitor.py` 比對資料庫，把變化彙整成一則通知 |
+| `com.example.sideloadly-bot` | 常駐 | `bot.py` 處理 Telegram 指令，兼任監控看門狗 |
+| `com.example.sideloadly-daily-restart` | 每天 04:00 | `restart.py` 只在重啟解得掉的問題上動手 |
 
 資料來源是 Sideloadly 自己的 sqlite（**唯讀開啟**，不寫入）：
 `~/Library/Application Support/sideloadly/installations.db`
@@ -123,9 +123,9 @@ Sideloadly 的資料庫裡，`monitor.py` 就會一直為它發過期/離線告�
 也會一直把它列進「需要重啟」的理由。`/forget`（`/forgotten` 查看與復原）讓
 你把這些條目從報表和告警裡拿掉。
 
-**這份清單完全是本專案自己的本機狀態（`ignored.json`），跟 `installations.db`
+**這份清單完全是本專案自己的本機狀態（`forgotten.json`），跟 `installations.db`
 無關。** 那個資料庫是 Sideloadly 的內部狀態，這個專案從頭到尾唯讀開啟、不寫
-入（見下方「架構」一節）——forget 因此不可能、也不會去改 Sideloadly 自己的
+入（見上方「架構」一節）——forget 因此不可能、也不會去改 Sideloadly 自己的
 資料，只是在讀出來之後多一層本機過濾。忘記一整台裝置會連帶忘記它底下所有
 app，不用逐一忘記；忘記單一 app 則不影響同裝置上的其他 app。`common.py` 的
 `visible_installs()` / `visible_devices()` 是唯一的過濾點，`build_status_report`、
@@ -158,7 +158,7 @@ Sideloadly 沒開這個口，最後一哩一定得有人在 Mac 的 GUI 上完�
 `--enqueue` 的值幾乎可以確定是 `installations.enqueue_token`（欄位就叫這個名字，
 平時是空的，由 Sideloadly 自己在需要時產生）。隨便餵一個值它會安靜忽略，而我們
 造不出有效的 token；唯一的繞法是自己往 `installations.db` 寫入，那正是這個專案
-從第一天就拒絕做的事（見下方架構一節）。
+從第一天就拒絕做的事（見上方「架構」一節）。
 
 實驗方法附記，之後要重驗才不用重新摸索：**第二次啟動 Sideloadly 不會真的開第
 二個實例**——它綁 localhost:28811 失敗後，會把命令列參數轉發給正在跑的那個實
@@ -227,6 +227,7 @@ Apple ID 只留本地端前幾個字（`common.short_apple_id`，長度是
 
 ```sh
 ./query.py            # 同 /status
+./query.py accounts   # 同 /accounts
 ./query.py log
 ./query.py stats
 ./query.py forgotten  # 同 /forgotten
@@ -239,7 +240,7 @@ Apple ID 只留本地端前幾個字（`common.short_apple_id`，長度是
 ## 需求
 
 - macOS（要有 Sideloadly.app 及其 `installations.db`，排程也是用 launchd）
-- Python 3.9+，全部用標準庫，不用另外 `pip install`
+- Python 3.11+（要靠它的 `datetime.fromisoformat` 直接讀 Sideloadly 的時間格式），全部用標準庫，不用另外 `pip install`
 
 ## 安裝與部署
 
@@ -267,7 +268,7 @@ cd sideloadly-monitor
 4. 傳 `/status` 給 bot 確認有回應。
 
 `restart.py` 預設用 `launchctl kickstart` 重啟 label 為 `io.sideloadly.daemon` 的
-Sideloadly daemon（`config.py` 的 `RESTART_LABEL`），如果你的環境 label 不同要一併改。
+Sideloadly daemon（`config.py` 的 `DAEMON_LABEL`），如果你的環境 label 不同要一併改。
 
 ## 設定
 
@@ -326,7 +327,7 @@ tick 骨架。**卡點的樣子是某個 `Will tick` 後面沒有對應的 `Done
 - `events.db` — 事件歷史，`/log` 和 `/stats` 的來源
 - `mute_until.txt` — 靜音到期時間，存在才算靜音
 - `bot_offset.txt` — Telegram update offset
-- `ignored.json` — `/forget` 忘記的裝置/app 清單（見上方「忘記某個裝置或 app」）
+- `forgotten.json` — `/forget` 忘記的裝置/app 清單（見上方「忘記某個裝置或 app」）
 
 ## 測試
 

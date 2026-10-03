@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import http.client
 import json
 import os
 import re
@@ -15,9 +16,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 import config
-import ignore
+import forget
 
-_TS_RE = re.compile(r"^(?P<base>.*)\.(?P<frac>\d+)(?P<tz>[+-]\d{2}:\d{2})?$")
 _STATE_RE = re.compile(r"^\s*state = (\S+)", re.MULTILINE)
 
 # sideloadly 用 Go 的 zero time 當「沒有值」，不是 NULL。
@@ -26,8 +26,13 @@ ZERO_TS_PREFIX = "0001-01-01"
 
 # ---------------------------------------------------------------- Telegram
 
-def api(method: str, **params) -> dict | None:
-    """呼叫 Telegram Bot API。dict/list 參數自動轉 JSON，None 直接略過。"""
+def api(method: str, http_timeout: float = 15, **params) -> dict | None:
+    """呼叫 Telegram Bot API。dict/list 參數自動轉 JSON，None 直接略過。
+
+    http_timeout 是這次 HTTP 請求的逾時秒數，跟 Telegram 自己的 timeout 參數
+    （getUpdates 的 long polling 秒數）是兩回事，所以不能叫 timeout。
+    失敗只印到 stderr 並回 None。
+    """
     url = f"https://api.telegram.org/bot{config.BOT_TOKEN}/{method}"
     payload = {}
     for key, value in params.items():
@@ -40,43 +45,40 @@ def api(method: str, **params) -> dict | None:
         )
     try:
         with urllib.request.urlopen(
-            url, data=urllib.parse.urlencode(payload).encode(), timeout=15
+            url, data=urllib.parse.urlencode(payload).encode(), timeout=http_timeout
         ) as resp:
             return json.loads(resp.read())
-    except OSError as exc:
+    except (OSError, ValueError, http.client.HTTPException) as exc:
+        # OSError 涵蓋連線錯誤與 HTTP 錯誤碼；ValueError 是回應不是 JSON；
+        # HTTPException（例如讀到一半斷線的 IncompleteRead）不是 OSError，要另外接。
         print(f"{method} 失敗: {exc}", file=sys.stderr, flush=True)
         return None
 
 
-def send_message(text: str, chat_id: str | None = None, reply_markup=None):
+def send_message(text: str, reply_markup=None):
     """送純文字。過長會依行界切段，按鈕只掛在最後一段。"""
-    chunks = _chunk(text, config.MESSAGE_CHUNK_LIMIT)
-    for index, chunk in enumerate(chunks):
-        api(
-            "sendMessage",
-            chat_id=chat_id or config.CHAT_ID,
-            text=chunk,
-            reply_markup=reply_markup if index == len(chunks) - 1 else None,
-        )
+    _send_chunks(_chunk(text, config.MESSAGE_CHUNK_LIMIT), reply_markup)
 
 
-def send_report(text: str, chat_id: str | None = None, reply_markup=None):
+def send_report(text: str, reply_markup=None):
     """送報表。包成 <pre> 讓 Telegram 用等寬字，欄位才對得齊。"""
     # 先切段再包標籤，否則長訊息會把 <pre> 切成兩半變成壞掉的 HTML。
-    chunks = _chunk(text, config.REPORT_CHUNK_LIMIT)
+    chunks = [
+        f"<pre>{html.escape(chunk)}</pre>"
+        for chunk in _chunk(text, config.REPORT_CHUNK_LIMIT)
+    ]
+    _send_chunks(chunks, reply_markup, parse_mode="HTML")
+
+
+def _send_chunks(chunks: list[str], reply_markup, **params):
     for index, chunk in enumerate(chunks):
         api(
             "sendMessage",
-            chat_id=chat_id or config.CHAT_ID,
-            text=f"<pre>{html.escape(chunk)}</pre>",
-            parse_mode="HTML",
+            chat_id=config.CHAT_ID,
+            text=chunk,
             reply_markup=reply_markup if index == len(chunks) - 1 else None,
+            **params,
         )
-
-
-def answer_callback(callback_id: str, text: str | None = None):
-    """按鈕按下後一定要回應，否則 Telegram 會一直轉圈。"""
-    api("answerCallbackQuery", callback_query_id=callback_id, text=text)
 
 
 def _chunk(text: str, limit: int) -> list[str]:
@@ -94,9 +96,9 @@ def _chunk(text: str, limit: int) -> list[str]:
     return chunks
 
 
-def notify(title: str, message: str, force: bool = False):
+def notify(title: str, message: str):
     """主動推送。靜音期間會被丟掉（bot 回覆請直接用 send_message）。"""
-    if not force and mute_remaining() is not None:
+    if mute_remaining() is not None:
         return
     send_message(f"{title}\n{message}")
 
@@ -105,54 +107,45 @@ def notify(title: str, message: str, force: bool = False):
 
 def mute_remaining() -> timedelta | None:
     """回傳剩餘靜音時間，未靜音則 None。"""
-    if not config.MUTE_PATH.exists():
+    if not config.MUTE_UNTIL_PATH.exists():
         return None
-    until = parse_ts(config.MUTE_PATH.read_text().strip())
+    until = parse_ts(config.MUTE_UNTIL_PATH.read_text().strip())
     if until is None:
         return None
     remaining = until - datetime.now(timezone.utc)
     if remaining.total_seconds() <= 0:
-        config.MUTE_PATH.unlink(missing_ok=True)
+        config.MUTE_UNTIL_PATH.unlink(missing_ok=True)
         return None
     return remaining
 
 
 def set_mute(hours: float) -> datetime:
     until = datetime.now(timezone.utc) + timedelta(hours=hours)
-    config.MUTE_PATH.write_text(until.isoformat())
+    config.MUTE_UNTIL_PATH.write_text(until.isoformat())
     return until
 
 
 def clear_mute():
-    config.MUTE_PATH.unlink(missing_ok=True)
+    config.MUTE_UNTIL_PATH.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------- 時間處理
 
 def parse_ts(value):
+    # Sideloadly 的時間字串微秒位數不固定（例如 .13506 只有 5 位），
+    # account-appids.json 則是 Z 結尾；Python 3.11 起的 fromisoformat 都吃得下。
     if not value or str(value).startswith(ZERO_TS_PREFIX):
         return None
-    # SQLite 省略微秒尾端的 0（例如 .13506 只有 5 位），舊版 Python 的
-    # fromisoformat 只接受 3 或 6 位微秒，先補零以免解析失敗。
-    match = _TS_RE.match(value)
-    if match:
-        frac = match.group("frac")[:6].ljust(6, "0")
-        value = f"{match.group('base')}.{frac}{match.group('tz') or ''}"
     try:
         return datetime.fromisoformat(value)
     except (TypeError, ValueError):
         return None
 
 
-def age_days(ts) -> float | None:
+def age_hours(ts) -> float | None:
     if ts is None:
         return None
-    return (datetime.now(timezone.utc) - ts).total_seconds() / 86400
-
-
-def age_hours(ts) -> float | None:
-    days = age_days(ts)
-    return None if days is None else days * 24
+    return (datetime.now(timezone.utc) - ts).total_seconds() / 3600
 
 
 def display_width(text: str) -> int:
@@ -174,6 +167,11 @@ def human_delta(seconds: float) -> str:
     if seconds < 86400:
         return f"{seconds / 3600:.1f} 小時"
     return f"{seconds / 86400:.1f} 天"
+
+
+def ago(ts: datetime) -> str:
+    """「3.2 小時前」這種說法。"""
+    return f"{human_delta((datetime.now(timezone.utc) - ts).total_seconds())}前"
 
 
 # ------------------------------------------------------------------- 資料
@@ -223,11 +221,6 @@ class Install:
         return bool(self.last_error) or self.failures_count > 0
 
     @property
-    def failure_age_hours(self) -> float | None:
-        """距最後一次失敗多久。None = 沒有時間戳（沒失敗過，或 sideloadly 沒寫）。"""
-        return age_hours(self.last_failure_at)
-
-    @property
     def stale_failure(self) -> bool:
         """舊帳：旗標還亮著，但沒有證據顯示現在還在失敗。
 
@@ -243,7 +236,7 @@ class Install:
             and self.last_updated > self.last_failure_at
         ):
             return True
-        age = self.failure_age_hours
+        age = age_hours(self.last_failure_at)
         # 沒有時間戳就沒有「現在還在失敗」的證據，當舊帳處理。monitor 的告警與
         # /status 仍然看得到這個錯誤，只是不會拿它當重啟的理由。
         if age is None:
@@ -263,9 +256,8 @@ class Install:
         """錯誤內容加上它有多舊。同一個旗標會亮到下一次刷新成功為止，少了時間
         就分不出「剛剛還在失敗」跟「兩天前的舊帳」。"""
         text = f"{self.last_error or '未知錯誤'}（{self.failures_count} 次"
-        age = self.failure_age_hours
-        if age is not None:
-            text += f"，{human_delta(age * 3600)}前"
+        if self.last_failure_at:
+            text += f"，{ago(self.last_failure_at)}"
         if self.stale_failure:
             text += "，等下次刷新才會清"
         return text + "）"
@@ -295,7 +287,6 @@ class Device:
     name: str
     last_seen: datetime | None
     last_error: str | None
-    failures_count: int
 
     @property
     def offline(self) -> bool:
@@ -303,38 +294,15 @@ class Device:
         return hours is None or hours > config.DEVICE_OFFLINE_HOURS
 
     def seen_text(self) -> str:
-        if self.last_seen is None:
-            return "從未連線"
-        return f"{human_delta((datetime.now(timezone.utc) - self.last_seen).total_seconds())}前"
-
-    def seen_label(self) -> str:
-        return "從未連線" if self.last_seen is None else f"{self.seen_text()}連線"
+        return "從未連線" if self.last_seen is None else ago(self.last_seen)
 
 
 def connect_readonly() -> sqlite3.Connection:
+    """唯讀開 Sideloadly 的資料庫。那是它的內部狀態，這個專案只讀不寫——
+    /forget 這類要「改」的東西，都只記在本專案自己的檔案裡。"""
     con = sqlite3.connect(f"file:{config.SIDELOADLY_DB_PATH}?mode=ro", uri=True)
     con.row_factory = sqlite3.Row
     return con
-
-
-def _to_install(row: sqlite3.Row) -> Install:
-    last_updated = parse_ts(row["last_updated"])
-    ttl_days = row["known_ttl"] or config.DEFAULT_KNOWN_TTL_DAYS
-    refresh_hours = row["refresh_at_hours"] or config.DEFAULT_REFRESH_AT_HOURS
-    return Install(
-        id=str(row["id"]),
-        device_udid=row["device_udid"],
-        device_name=row["device_name"] or row["device_udid"],
-        app_name=row["app_name"],
-        version=row["version"],
-        apple_id=row["apple_id"] or None,
-        last_updated=last_updated,
-        expires_at=last_updated + timedelta(days=ttl_days) if last_updated else None,
-        refresh_due_at=last_updated + timedelta(hours=refresh_hours) if last_updated else None,
-        last_error=row["last_error"] or None,
-        failures_count=row["failures_count"] or 0,
-        last_failure_at=parse_ts(row["last_failure_at"]),
-    )
 
 
 def fetch_installs() -> list[Install]:
@@ -354,14 +322,38 @@ def fetch_installs() -> list[Install]:
         ).fetchall()
     finally:
         con.close()
-    return [_to_install(row) for row in rows]
+
+    installs = []
+    for row in rows:
+        last_updated = parse_ts(row["last_updated"])
+        ttl_days = row["known_ttl"] or config.DEFAULT_KNOWN_TTL_DAYS
+        refresh_hours = row["refresh_at_hours"] or config.DEFAULT_REFRESH_AT_HOURS
+        installs.append(
+            Install(
+                id=str(row["id"]),
+                device_udid=row["device_udid"],
+                device_name=row["device_name"] or row["device_udid"],
+                app_name=row["app_name"],
+                version=row["version"],
+                apple_id=row["apple_id"] or None,
+                last_updated=last_updated,
+                expires_at=last_updated + timedelta(days=ttl_days) if last_updated else None,
+                refresh_due_at=(
+                    last_updated + timedelta(hours=refresh_hours) if last_updated else None
+                ),
+                last_error=row["last_error"] or None,
+                failures_count=row["failures_count"] or 0,
+                last_failure_at=parse_ts(row["last_failure_at"]),
+            )
+        )
+    return installs
 
 
 def fetch_devices() -> list[Device]:
     con = connect_readonly()
     try:
         rows = con.execute(
-            "SELECT udid, name, last_seen, last_error, failures_count FROM devices ORDER BY name"
+            "SELECT udid, name, last_seen, last_error FROM devices ORDER BY name"
         ).fetchall()
     finally:
         con.close()
@@ -371,7 +363,6 @@ def fetch_devices() -> list[Device]:
             name=row["name"] or row["udid"],
             last_seen=parse_ts(row["last_seen"]),
             last_error=row["last_error"] or None,
-            failures_count=row["failures_count"] or 0,
         )
         for row in rows
     ]
@@ -380,18 +371,18 @@ def fetch_devices() -> list[Device]:
 def visible_installs() -> list[Install]:
     """套用本地 /forget 清單。報表和 monitor/restart 的判斷一律要用這個，
     不要直接用 fetch_installs()，否則忘記的裝置/app 還是會觸發告警或自動重啟。"""
-    ignored_devices, ignored_installs = ignore.ignored_keys()
+    forgotten_devices, forgotten_installs = forget.forgotten_keys()
     return [
         i
         for i in fetch_installs()
-        if i.device_udid not in ignored_devices
-        and (i.device_udid, i.app_name) not in ignored_installs
+        if i.device_udid not in forgotten_devices
+        and (i.device_udid, i.app_name) not in forgotten_installs
     ]
 
 
 def visible_devices() -> list[Device]:
-    ignored_devices, _ = ignore.ignored_keys()
-    return [d for d in fetch_devices() if d.udid not in ignored_devices]
+    forgotten_devices, _ = forget.forgotten_keys()
+    return [d for d in fetch_devices() if d.udid not in forgotten_devices]
 
 
 @dataclass
@@ -407,8 +398,6 @@ def fetch_account_quotas() -> dict[str, AccountQuota]:
     這個檔案跟 installations.db 一樣是 sideloadly 的內部狀態、沒有公開格式，
     所以任何欄位缺漏或格式不對都當作「讀不到」處理，不讓這個輔助功能弄壞主流程。
     """
-    if not config.ACCOUNT_APPIDS_PATH.exists():
-        return {}
     try:
         raw = json.loads(config.ACCOUNT_APPIDS_PATH.read_text())
     except (OSError, json.JSONDecodeError):
@@ -419,32 +408,20 @@ def fetch_account_quotas() -> dict[str, AccountQuota]:
             continue
         quotas[apple_id] = AccountQuota(
             apple_id=apple_id,
-            remaining=info.get("Remaining", 0),
+            remaining=info["Remaining"],
             nearest_ttl=parse_ts(info.get("NearestTtl")),
         )
     return quotas
 
 
-def suggest_alternate_account(
-    current_apple_id: str | None, quotas: dict[str, AccountQuota]
-) -> AccountQuota | None:
-    """目前這個帳號額度用完時，挑一個額度還沒用完、剩最多的其他已綁定帳號。
-
-    只挑本地資料看得到的線索（App ID 週配額），不代表一定能解決那次失敗——
-    Sideloadly 沒公開失敗原因的分類，這只是提示，不是診斷。
-    """
-    candidates = [
-        q for aid, q in quotas.items() if aid != current_apple_id and q.remaining > 0
-    ]
-    if not candidates:
-        return None
-    return max(candidates, key=lambda q: q.remaining)
-
-
 # ------------------------------------------------------------------- 報表
 
-# 問題區塊由重到輕排序。
-SEVERITY_ORDER = ["🔴 已過期", "❌ 刷新失敗", "⚠ 逾期未刷新", "📵 裝置離線"]
+# 問題區塊的標題，由重到輕排序。monitor 的通知用同一組標題，兩邊才不會各說各話。
+EXPIRED_HEADING = "🔴 已過期"
+FAILING_HEADING = "❌ 刷新失敗"
+OVERDUE_HEADING = "⚠ 逾期未刷新"
+OFFLINE_HEADING = "📵 裝置離線"
+SEVERITY_ORDER = [EXPIRED_HEADING, FAILING_HEADING, OVERDUE_HEADING, OFFLINE_HEADING]
 
 
 def short_apple_id(apple_id: str | None) -> str:
@@ -481,17 +458,17 @@ def build_status_report() -> str:
 
     for inst in installs:
         if inst.expired:
-            problems.setdefault(SEVERITY_ORDER[0], []).append(
+            problems.setdefault(EXPIRED_HEADING, []).append(
                 f"{inst.label}：{inst.expiry_short()}"
             )
             markers[inst.id] = "🔴"
         elif inst.overdue:
-            problems.setdefault(SEVERITY_ORDER[2], []).append(
+            problems.setdefault(OVERDUE_HEADING, []).append(
                 f"{inst.label}：{inst.expiry_short()}"
             )
             markers[inst.id] = "⚠"
         if inst.failing:
-            problems.setdefault(SEVERITY_ORDER[1], []).append(
+            problems.setdefault(FAILING_HEADING, []).append(
                 f"{inst.label}：{inst.failure_text()}"
             )
             markers[inst.id] = "❌"
@@ -501,14 +478,14 @@ def build_status_report() -> str:
         # 只有「有 app 在跑」的裝置離線才算問題，閒置裝置離線不算——但下面的
         # 表格仍會把它列出來，這是 /devices 併進來之後唯一還看得到它的地方。
         if device and device.offline:
-            problems.setdefault(SEVERITY_ORDER[3], []).append(
+            problems.setdefault(OFFLINE_HEADING, []).append(
                 f"{device.name}：最後連線 {device.seen_text()}"
             )
 
     lines = []
     if problems:
         count = sum(len(v) for v in problems.values())
-        severe = SEVERITY_ORDER[0] in problems or SEVERITY_ORDER[1] in problems
+        severe = EXPIRED_HEADING in problems or FAILING_HEADING in problems
         lines.append(f"{'🔴' if severe else '⚠'} {count} 個問題")
         lines.append("")
         for heading in SEVERITY_ORDER:
@@ -525,11 +502,7 @@ def build_status_report() -> str:
     latest = max((i.last_updated for i in installs if i.last_updated), default=None)
     summary = f"{len(devices)} 台裝置・{len(installs)} 個 app"
     if latest:
-        summary += (
-            "　最近刷新 "
-            + human_delta((datetime.now(timezone.utc) - latest).total_seconds())
-            + "前"
-        )
+        summary += f"　最近刷新 {ago(latest)}"
     lines.append(summary)
     lines.append("")
 
@@ -553,7 +526,8 @@ def build_status_report() -> str:
     )
 
     def render_device(device: Device, group: list[Install]):
-        header = pad(device.name, name_width) + device.seen_label()
+        seen = f"{ago(device.last_seen)}連線" if device.last_seen else "從未連線"
+        header = pad(device.name, name_width) + seen
         if device.offline:
             header += "  📵"
         lines.append(header.rstrip())
@@ -585,7 +559,6 @@ def build_status_report() -> str:
                 name=group[0].device_name,
                 last_seen=None,
                 last_error="裝置不在 devices 表裡",
-                failures_count=0,
             ),
             group,
         )
@@ -599,7 +572,7 @@ def build_status_report() -> str:
 
 def status_action_keyboard() -> dict | None:
     """有問題的 app 各配一顆按鈕，一鍵發動重新部署——動作其實是重啟整個
-    daemon（見 bot.py 的 redeploy 說明），這裡只負責點名是哪個 app 促成的。"""
+    daemon（見 bot.py 的 _start_restart_confirm），這裡只負責點名是哪個 app 促成的。"""
     # failing_now 不是 failing：舊帳按了也沒用，這顆按鈕做的是重啟整顆 daemon，
     # 而重啟既清不掉錯誤旗標也不會讓刷新提早。真的想手動重來一次仍然可以走
     # /redeploy，那支列的是全部的 app，不只有問題的那些。
@@ -616,9 +589,9 @@ def status_action_keyboard() -> dict | None:
     }
 
 
-def build_ignored_report() -> str:
-    devices = ignore.list_ignored_devices()
-    installs = ignore.list_ignored_installs()
+def build_forgotten_report() -> str:
+    devices = forget.forgotten_devices()
+    installs = forget.forgotten_installs()
     if not devices and not installs:
         return "目前沒有忘記任何裝置或 app。"
 
@@ -630,7 +603,7 @@ def build_ignored_report() -> str:
     if installs:
         lines.append("")
         lines.append("app：")
-        lines.extend(f"  · {i.device_name} - {i.app_name}" for i in installs)
+        lines.extend(f"  · {i.label}" for i in installs)
     return "\n".join(lines)
 
 
@@ -679,7 +652,7 @@ def build_account_report() -> str:
 def daemon_state() -> str | None:
     """回傳 launchd 對 daemon 的 state 字串，服務不存在時回 None。"""
     result = subprocess.run(
-        ["launchctl", "print", f"gui/{os.getuid()}/{config.RESTART_LABEL}"],
+        ["launchctl", "print", f"gui/{os.getuid()}/{config.DAEMON_LABEL}"],
         capture_output=True,
         text=True,
     )
@@ -689,8 +662,8 @@ def daemon_state() -> str | None:
     return match.group(1) if match else "unknown"
 
 
-def perform_restart(verify: bool = True) -> tuple[bool, str]:
-    target = f"gui/{os.getuid()}/{config.RESTART_LABEL}"
+def perform_restart() -> tuple[bool, str]:
+    target = f"gui/{os.getuid()}/{config.DAEMON_LABEL}"
     result = subprocess.run(
         ["launchctl", "kickstart", "-k", target],
         capture_output=True,
@@ -698,13 +671,11 @@ def perform_restart(verify: bool = True) -> tuple[bool, str]:
     )
     if result.returncode != 0:
         return False, result.stderr.strip() or result.stdout.strip() or "kickstart 失敗"
-    if not verify:
-        return True, f"已重啟 {config.RESTART_LABEL}"
 
     for _ in range(config.RESTART_VERIFY_ATTEMPTS):
         time.sleep(config.RESTART_VERIFY_INTERVAL_SECONDS)
         if daemon_state() == "running":
-            return True, f"已重啟 {config.RESTART_LABEL}，daemon 回到 running"
+            return True, f"已重啟 {config.DAEMON_LABEL}，daemon 回到 running"
     return False, (
         f"已送出重啟指令，但 daemon 沒回到 running（state={daemon_state()}）"
     )

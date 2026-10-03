@@ -8,13 +8,20 @@ state.json 的 last_run，發現 monitor 停擺就告警——否則
 import json
 import sys
 import time
-import urllib.request
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
+from functools import partial
 
 import common
 import config
+import forget
 import history
-import ignore
+
+DEFAULT_MUTE_HOURS = 8
+# /restart、/redeploy 送出確認後，多久內要按「確定重啟」或回 /confirm。
+CONFIRM_SECONDS = 60
+# getUpdates 的 long polling 秒數：沒有新訊息時，Telegram 最多讓連線掛這麼久才回。
+POLL_SECONDS = 30
 
 # 註冊給 Telegram，聊天室輸入框旁就會出現指令選單。
 BOT_COMMANDS = [
@@ -27,7 +34,7 @@ BOT_COMMANDS = [
     {"command": "redeploy", "description": "為某個 app 重新部署（重啟 daemon）"},
     {"command": "forget", "description": "忘記某個裝置或 app"},
     {"command": "forgotten", "description": "查看/復原忘記清單"},
-    {"command": "mute", "description": "暫停通知（預設 8 小時）"},
+    {"command": "mute", "description": f"暫停通知（預設 {DEFAULT_MUTE_HOURS} 小時）"},
     {"command": "unmute", "description": "解除靜音"},
     {"command": "help", "description": "說明"},
 ]
@@ -43,7 +50,7 @@ MENU_KEYBOARD = {
             {"text": "📈 統計", "callback_data": "stats"},
         ],
         [
-            {"text": "🔇 靜音 8 小時", "callback_data": "mute:8"},
+            {"text": f"🔇 靜音 {DEFAULT_MUTE_HOURS} 小時", "callback_data": "mute"},
             {"text": "🔔 解除靜音", "callback_data": "unmute"},
         ],
         [
@@ -61,7 +68,7 @@ CONFIRM_KEYBOARD = {
     "inline_keyboard": [
         [
             {"text": "✅ 確定重啟", "callback_data": "restart:go"},
-            {"text": "取消", "callback_data": "menu"},
+            {"text": "取消", "callback_data": "restart:cancel"},
         ]
     ]
 }
@@ -88,14 +95,11 @@ HELP_TEXT = (
     "/forget - 忘記某個裝置或 app，之後不再收到它的告警（只是本機清單，"
     "不會動到 Sideloadly 自己的資料）\n"
     "/forgotten - 查看已忘記清單，可以復原\n"
-    "/mute [小時] - 暫停主動通知（預設 8 小時）\n"
+    f"/mute [小時] - 暫停主動通知（預設 {DEFAULT_MUTE_HOURS} 小時）\n"
     "/unmute - 解除靜音\n\n"
     "過期倒數是依資料庫的憑證有效天數算的。\n"
     "靜音只擋主動通知，指令回覆照常，事件仍會記錄。"
 )
-
-CONFIRM_WINDOW = timedelta(seconds=60)
-DEFAULT_MUTE_HOURS = 8
 
 # {"until": datetime, "reason": str | None} — reason 是 /redeploy 點名的 app，
 # 一般 /restart 沒有 reason。兩者共用同一段確認流程與同一個 restart:go 按鈕。
@@ -103,80 +107,45 @@ _pending_restart: dict | None = None
 _heartbeat_alerted_at: datetime | None = None
 _heartbeat_was_stale = False
 
-# /forget、/forgotten 選單的「按鈕代號 → 動作」對照表，選單訊息送出時重建，
-# 只在下一次按鈕按下之前有效（跟 _pending_restart 一樣是進程內的暫存狀態，
-# 這個 bot 本來就是單一 chat 常駐一個進程，不需要更持久的存法）。
-# value 是 (kind, ignore_or_unignore 的位置參數 tuple, 顯示用的名字)。
-_forget_candidates: dict[str, tuple[str, tuple, str]] = {}
-_unforget_candidates: dict[str, tuple[str, tuple, str]] = {}
+# /forget、/forgotten 選單的「按鈕代號 → (按下去要做的事, 顯示用的名字)」，選單
+# 訊息送出時重建，只在下一次按鈕按下之前有效（跟 _pending_restart 一樣是進程內的
+# 暫存狀態，這個 bot 本來就是單一 chat 常駐一個進程，不需要更持久的存法）。
+# 代號用流水號，因為 callback_data 上限 64 bytes，塞不下 udid 加 app 名。
+_forget_candidates: dict[str, tuple[Callable[[], bool], str]] = {}
+_unforget_candidates: dict[str, tuple[Callable[[], bool], str]] = {}
 
 
-def _forget_options() -> list[tuple[str, tuple, str]]:
-    """目前還沒被忘記、可以拿去問「要不要忘記」的裝置與 app。"""
-    options = []
-    for d in common.fetch_devices():
-        if not ignore.is_device_ignored(d.udid):
-            options.append(("device", (d.udid, d.name), d.name))
-    for i in common.fetch_installs():
-        if not ignore.is_install_ignored(i.device_udid, i.app_name):
-            options.append(("install", (i.device_udid, i.device_name, i.app_name), i.label))
-    return options
-
-
-def _unforget_options() -> list[tuple[str, tuple, str]]:
-    """目前已經忘記、可以拿去問「要不要復原」的裝置與 app。"""
-    options = [
-        ("device", (d.udid,), d.name) for d in ignore.list_ignored_devices()
+def _picker_keyboard(action: str, buttons: list[tuple[str, str]]) -> dict:
+    """選項清單的按鈕：一個選項一列，超過上限的不列，最下面加回選單。
+    buttons 是 (callback 參數, 按鈕文字)。"""
+    rows = [
+        [{"text": text, "callback_data": f"{action}:{key}"}]
+        for key, text in buttons[: config.PICKER_MAX_BUTTONS]
     ]
-    options += [
-        ("install", (i.device_udid, i.app_name), f"{i.device_name} - {i.app_name}")
-        for i in ignore.list_ignored_installs()
-    ]
-    return options
+    return {"inline_keyboard": [*rows, BACK_TO_MENU_KEYBOARD_ROW]}
 
 
-def _picker_keyboard(rows: list[list[dict]]) -> dict:
-    return {"inline_keyboard": rows + [BACK_TO_MENU_KEYBOARD_ROW]}
-
-
-def _start_redeploy_confirm(reason: str | None):
+def _start_restart_confirm(reason: str | None):
     """/restart 與 /redeploy 共用的確認流程，差別只在訊息措辭跟事後紀錄要不要
     點名是哪個 app——實際動作兩邊完全一樣，都是整顆 daemon 重啟。"""
     global _pending_restart
     _pending_restart = {
-        "until": datetime.now(timezone.utc) + CONFIRM_WINDOW,
+        "until": datetime.now(timezone.utc) + timedelta(seconds=CONFIRM_SECONDS),
         "reason": reason,
     }
     if reason:
         text = (
             f"⚠ 確定要為了「{reason}」重新部署？\n"
             "這個動作是重啟整顆 Sideloadly daemon（目前沒有辦法只重簽單一 app），"
-            "其他裝置／app 正在進行的刷新也會被一起打斷。60 秒內確認，或直接忽略。"
+            f"其他裝置／app 正在進行的刷新也會被一起打斷。{CONFIRM_SECONDS} 秒內確認，"
+            "或直接忽略。"
         )
     else:
         text = (
             "⚠ 確定要重啟 Sideloadly daemon？\n"
-            "正在進行的刷新會被打斷。60 秒內確認，或直接忽略。"
+            f"正在進行的刷新會被打斷。{CONFIRM_SECONDS} 秒內確認，或直接忽略。"
         )
     common.send_message(text, reply_markup=CONFIRM_KEYBOARD)
-
-
-def load_offset() -> int:
-    if config.BOT_OFFSET_PATH.exists():
-        return int(config.BOT_OFFSET_PATH.read_text().strip() or 0)
-    return 0
-
-
-def save_offset(offset: int):
-    config.BOT_OFFSET_PATH.write_text(str(offset))
-
-
-def get_updates(offset: int, timeout: int = 30) -> list[dict]:
-    url = f"https://api.telegram.org/bot{config.BOT_TOKEN}/getUpdates"
-    query = f"offset={offset}&timeout={timeout}"
-    with urllib.request.urlopen(f"{url}?{query}", timeout=timeout + 10) as resp:
-        body = json.loads(resp.read())
-    return body.get("result", [])
 
 
 def _int_arg(args: list[str], default: int, lo: int, hi: int) -> int:
@@ -221,23 +190,29 @@ def dispatch(action: str, args: list[str]):
             reply_markup=MENU_KEYBOARD,
         )
 
-    elif action == "restart":
-        _start_redeploy_confirm(None)
-
-    elif action == "restart:go":
+    elif action == "restart" and args[:1] == ["go"]:
         if _pending_restart is None or datetime.now(timezone.utc) > _pending_restart["until"]:
             _pending_restart = None
-            common.send_message("確認已逾時，請重新操作。", reply_markup=MENU_KEYBOARD)
+            common.send_message(
+                "沒有待確認的重啟（已逾時或已取消），請重新操作。", reply_markup=MENU_KEYBOARD
+            )
             return
         reason = _pending_restart.get("reason")
         _pending_restart = None
         common.send_message("正在重啟，稍候…")
         ok, result = common.perform_restart()
-        detail = f"telegram(為了 {reason}): {result}" if reason else f"telegram: {result}"
-        history.record("restart", detail=detail)
+        history.record_restart(ok, result, f"telegram，為了 {reason}" if reason else "telegram")
         common.send_message(
             ("✅ " if ok else "❌ ") + result, reply_markup=MENU_KEYBOARD
         )
+
+    elif action == "restart" and args[:1] == ["cancel"]:
+        # 只換成選單不夠：舊訊息上的「確定重啟」還按得到，不清掉就等於沒取消。
+        _pending_restart = None
+        common.send_message("已取消重啟。", reply_markup=MENU_KEYBOARD)
+
+    elif action == "restart":
+        _start_restart_confirm(None)
 
     elif action == "redeploy":
         target = args[0] if args else None
@@ -248,14 +223,10 @@ def dispatch(action: str, args: list[str]):
                     "沒有任何裝置資料，沒有東西可以重新部署。", reply_markup=MENU_KEYBOARD
                 )
                 return
-            rows = [
-                [{"text": i.label, "callback_data": f"redeploy:{i.id}"}]
-                for i in installs[: config.PICKER_MAX_BUTTONS]
-            ]
             common.send_message(
                 "選一個 app：實際動作是重啟整顆 daemon，這裡只是讓訊息和紀錄"
                 "點名是為了哪個 app。",
-                reply_markup=_picker_keyboard(rows),
+                reply_markup=_picker_keyboard("redeploy", [(i.id, i.label) for i in installs]),
             )
             return
         match = next((i for i in common.fetch_installs() if i.id == target), None)
@@ -264,63 +235,67 @@ def dispatch(action: str, args: list[str]):
                 "找不到這個 app 了，可能已經被刪除或重簽過。", reply_markup=MENU_KEYBOARD
             )
             return
-        _start_redeploy_confirm(match.label)
+        _start_restart_confirm(match.label)
 
     elif action == "forget":
         if args and args[0] in _forget_candidates:
-            kind, fargs, label = _forget_candidates.pop(args[0])
-            added = ignore.ignore_device(*fargs) if kind == "device" else ignore.ignore_install(*fargs)
+            apply, label = _forget_candidates.pop(args[0])
             text = (
                 f"🙈 已忘記「{label}」，之後不會再收到它的告警。"
-                if added
+                if apply()
                 else f"「{label}」本來就已經忘記了。"
             )
             common.send_message(text + "\n可用 /forgotten 查看或復原。", reply_markup=MENU_KEYBOARD)
             return
 
-        options = _forget_options()[: config.PICKER_MAX_BUTTONS]
-        _forget_candidates = {}
+        options = [
+            (partial(forget.forget_device, d.udid, d.name), d.name)
+            for d in common.visible_devices()
+        ] + [
+            (partial(forget.forget_install, i.device_udid, i.device_name, i.app_name), i.label)
+            for i in common.visible_installs()
+        ]
+        _forget_candidates = {str(n): option for n, option in enumerate(options, start=1)}
         if not options:
             common.send_message("目前沒有可以忘記的裝置或 app 了。", reply_markup=MENU_KEYBOARD)
             return
-        rows = []
-        for idx, (kind, fargs, label) in enumerate(options, start=1):
-            key = str(idx)
-            _forget_candidates[key] = (kind, fargs, label)
-            rows.append([{"text": label, "callback_data": f"forget:{key}"}])
         common.send_message(
             "選一個要忘記的裝置或 app（忘記後不會再看到它的告警，可用 "
             "/forgotten 復原）：",
-            reply_markup=_picker_keyboard(rows),
+            reply_markup=_picker_keyboard(
+                "forget", [(key, label) for key, (_, label) in _forget_candidates.items()]
+            ),
         )
 
     elif action == "forgotten":
         if args and args[0] in _unforget_candidates:
-            kind, fargs, label = _unforget_candidates.pop(args[0])
-            removed = (
-                ignore.unignore_device(*fargs) if kind == "device" else ignore.unignore_install(*fargs)
-            )
+            apply, label = _unforget_candidates.pop(args[0])
             text = (
                 f"🔔 已取消忘記「{label}」，之後會恢復告警。"
-                if removed
+                if apply()
                 else f"「{label}」不在忘記清單裡（可能已經復原過了）。"
             )
             common.send_message(text, reply_markup=MENU_KEYBOARD)
             return
 
-        options = _unforget_options()[: config.PICKER_MAX_BUTTONS]
-        _unforget_candidates = {}
-        report = common.build_ignored_report()
+        options = [
+            (partial(forget.unforget_device, d.udid), d.name)
+            for d in forget.forgotten_devices()
+        ] + [
+            (partial(forget.unforget_install, i.device_udid, i.app_name), i.label)
+            for i in forget.forgotten_installs()
+        ]
+        _unforget_candidates = {str(n): option for n, option in enumerate(options, start=1)}
+        report = common.build_forgotten_report()
         if not options:
             common.send_message(report, reply_markup=MENU_KEYBOARD)
             return
-        rows = []
-        for idx, (kind, fargs, label) in enumerate(options, start=1):
-            key = str(idx)
-            _unforget_candidates[key] = (kind, fargs, label)
-            rows.append([{"text": f"🔔 {label}", "callback_data": f"forgotten:{key}"}])
         common.send_message(
-            report + "\n\n點按鈕可以取消忘記：", reply_markup=_picker_keyboard(rows)
+            report + "\n\n點按鈕可以取消忘記：",
+            reply_markup=_picker_keyboard(
+                "forgotten",
+                [(key, f"🔔 {label}") for key, (_, label) in _unforget_candidates.items()],
+            ),
         )
 
     elif action == "mute":
@@ -358,23 +333,20 @@ def handle_message(message: dict):
     if command in ("start", "help"):
         dispatch("help", args)
     elif command == "confirm":
-        dispatch("restart:go", args)
+        dispatch("restart", ["go"])
     else:
         dispatch(command, args)
 
 
 def handle_callback(callback: dict):
     # 按鈕按下後一定要回應，否則 Telegram 端會一直轉圈。
-    common.answer_callback(callback.get("id", ""))
+    common.api("answerCallbackQuery", callback_query_id=callback.get("id", ""))
     chat_id = str(callback.get("message", {}).get("chat", {}).get("id", ""))
     if chat_id != str(config.CHAT_ID):
         return
 
     action, _, arg = (callback.get("data") or "").partition(":")
-    if action == "restart" and arg == "go":
-        dispatch("restart:go", [])
-    else:
-        dispatch(action, [arg] if arg else [])
+    dispatch(action, [arg] if arg else [])
 
 
 # ----------------------------------------------------------------- 看門狗
@@ -420,20 +392,23 @@ def check_heartbeat():
 
 
 def main():
-    offset = load_offset()
+    offset = 0
+    if config.BOT_OFFSET_PATH.exists():
+        offset = int(config.BOT_OFFSET_PATH.read_text().strip() or 0)
     if common.api("setMyCommands", commands=BOT_COMMANDS):
         print("已註冊指令選單", flush=True)
     print(f"sideloadly bot 啟動，offset={offset}", flush=True)
 
     while True:
-        try:
-            updates = get_updates(offset)
-        except Exception as exc:
-            print(f"getUpdates 失敗: {exc}", file=sys.stderr, flush=True)
+        # HTTP 的逾時要比 long polling 長，否則沒有新訊息的每一輪都會變成逾時錯誤。
+        body = common.api(
+            "getUpdates", http_timeout=POLL_SECONDS + 10, offset=offset, timeout=POLL_SECONDS
+        )
+        if body is None:
             time.sleep(5)
             continue
 
-        for update in updates:
+        for update in body.get("result", []):
             offset = update["update_id"] + 1
             try:
                 if "message" in update:
@@ -442,7 +417,7 @@ def main():
                     handle_callback(update["callback_query"])
             except Exception as exc:
                 print(f"處理 update 失敗: {exc}", file=sys.stderr, flush=True)
-        save_offset(offset)
+        config.BOT_OFFSET_PATH.write_text(str(offset))
 
         try:
             check_heartbeat()
