@@ -77,18 +77,23 @@ HEARTBEAT_REPEAT_HOURS = 6
 RESTART_VERIFY_ATTEMPTS = 5
 RESTART_VERIFY_INTERVAL_SECONDS = 2
 
-# ------------------------------------------------------- Sideloadly daemon 日誌
+# ------------------------------------------------------------------- 日誌
 # Sideloadly 內建的日誌功能從來沒運作過：它想在「目前工作目錄」建
 # sideloadlydaemon.log，而 launchd 啟動的行程工作目錄是 /，macOS 的系統卷唯讀，
 # 於是每次啟動都寫失敗然後一聲不吭繼續跑。改成在它的 LaunchAgent 加
 # StandardErrorPath 把 stderr 接住（~/Library/LaunchAgents/io.sideloadly.daemon.plist，
 # 原檔備份成同名 .bak）。這是「卡住的時候到底發生什麼」唯一的證據來源。
-DAEMON_LOG_PATH = Path.home() / "Library/Logs/sideloadly-daemon.err.log"
-# 它每個 tick 都會把每台裝置上全部已安裝 app 列一遍（一台就五十幾個），實測約
-# 200 MB/天，不收會一直長。
-DAEMON_LOG_MAX_BYTES = 20 * 1024 * 1024
+DAEMON_ERR_LOG_PATH = Path.home() / "Library/Logs/sideloadly-daemon.err.log"
+# LaunchAgent 也設了 StandardOutPath 的話 stdout 寫在這裡；沒設就不存在，輪替時略過。
+DAEMON_OUT_LOG_PATH = Path.home() / "Library/Logs/sideloadly-daemon.out.log"
+# 本專案三個 launchd job 的 *.log（plist 的 StandardOutPath / StandardErrorPath）。
+LOG_DIR = PROJECT_DIR
+# monitor 每輪檢查上面這些日誌，超過上限就留一段尾巴、原地清空（見 common.rotate_log）。
+# daemon 的 stderr 每個 tick 都會把每台裝置上全部已安裝 app 列一遍（一台就五十幾個），
+# 實測約 200 MB/天；其他日誌長得慢，但斷網時 bot.err.log 每 5 秒多一行，一樣要有上限。
+LOG_MAX_BYTES = 20 * 1024 * 1024
 # 清空前先留一份尾巴，否則剛好在卡住之後才輪替，等於把要查的證據丟掉。
-DAEMON_LOG_KEEP_BYTES = 2 * 1024 * 1024
+LOG_KEEP_BYTES = 2 * 1024 * 1024
 
 # /forget、/forgotten、/redeploy 的選單訊息最多列幾顆按鈕，避免裝置/app 一多
 # 整則訊息炸開（Telegram 單則訊息的按鈕數也有上限）。

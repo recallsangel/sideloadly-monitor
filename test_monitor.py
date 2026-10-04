@@ -30,9 +30,12 @@ config.STATE_PATH = TMP / "state.json"
 config.EVENTS_DB_PATH = TMP / "events.db"
 config.MUTE_UNTIL_PATH = TMP / "mute_until.txt"
 config.FORGOTTEN_PATH = TMP / "forgotten.json"
-# monitor.main() 每輪都會輪替 daemon 日誌，所以這條路徑在整份測試裡都不能指到
-# 真實檔案——只在用到的那一段才導開是不夠的：那之後還有十幾次 monitor.main()。
-config.DAEMON_LOG_PATH = TMP / "daemon.err.log"
+# monitor.main() 每輪都會輪替日誌，所以這些路徑在整份測試裡都不能指到真實檔案——
+# 只在用到的那一段才導開是不夠的：那之後還有十幾次 monitor.main()。
+config.DAEMON_ERR_LOG_PATH = TMP / "daemon.err.log"
+config.DAEMON_OUT_LOG_PATH = TMP / "daemon.out.log"
+config.LOG_DIR = TMP / "logs"
+config.LOG_DIR.mkdir()
 
 import bot
 import common
@@ -166,40 +169,50 @@ state = json.loads(config.STATE_PATH.read_text())
 check("state.json 清掉資料庫裡已經沒有的 app",
       "999999" not in state["installs"] and "999999" not in state["expired_notified"])
 
-# --------------------------------------------------- daemon 日誌輪替
+# ------------------------------------------------------------------ 日誌輪替
 
 # 路徑在檔案最上面就導到 TMP 了，這裡只要把門檻縮小到測得動的尺寸，
 # 結束時務必還原——否則後面每次 monitor.main() 都會拿 1000 bytes 的門檻去砍。
-_real_max, _real_keep = config.DAEMON_LOG_MAX_BYTES, config.DAEMON_LOG_KEEP_BYTES
-config.DAEMON_LOG_MAX_BYTES = 1000
-config.DAEMON_LOG_KEEP_BYTES = 200
+_real_max, _real_keep = config.LOG_MAX_BYTES, config.LOG_KEEP_BYTES
+config.LOG_MAX_BYTES = 1000
+config.LOG_KEEP_BYTES = 200
+daemon_log = config.DAEMON_ERR_LOG_PATH
 
-check("檔案不存在時不做事", common.rotate_daemon_log() is None)
+check("檔案不存在時不做事", common.rotate_log(daemon_log) is None)
 
-config.DAEMON_LOG_PATH.write_bytes(b"x" * 500)
-check("沒超過上限時不做事", common.rotate_daemon_log() is None)
-check("沒超過上限時檔案原封不動", config.DAEMON_LOG_PATH.stat().st_size == 500)
+daemon_log.write_bytes(b"x" * 500)
+check("沒超過上限時不做事", common.rotate_log(daemon_log) is None)
+check("沒超過上限時檔案原封不動", daemon_log.stat().st_size == 500)
 
 # 尾巴要留得到：最後 200 bytes 是可辨識的內容，前面才是填充。
-config.DAEMON_LOG_PATH.write_bytes(b"o" * 2000 + b"TAIL" * 50)
-result = common.rotate_daemon_log()
+daemon_log.write_bytes(b"o" * 2000 + b"TAIL" * 50)
+result = common.rotate_log(daemon_log)
 check("超過上限就輪替", result is not None and "已清空" in result)
-check("原檔被清空", config.DAEMON_LOG_PATH.stat().st_size == 0)
+check("原檔被清空", daemon_log.stat().st_size == 0)
 
-kept = config.DAEMON_LOG_PATH.with_name(config.DAEMON_LOG_PATH.name + ".1")
+kept = daemon_log.with_name(daemon_log.name + ".1")
 check("尾巴另存成 .1", kept.exists())
 check("留下的是最後那一段而不是開頭", kept.read_bytes() == b"TAIL" * 50)
 
 # 清空而不是改名，是因為 launchd 開著這個檔的 fd。改名的話 daemon 會繼續往
 # 舊 inode 寫，新檔永遠是空的——所以原檔的 inode 必須不變。
-before_inode = config.DAEMON_LOG_PATH.stat().st_ino
-config.DAEMON_LOG_PATH.write_bytes(b"z" * 2000)
-common.rotate_daemon_log()
-check("輪替後仍是同一個 inode（沒有改名）",
-      config.DAEMON_LOG_PATH.stat().st_ino == before_inode)
+before_inode = daemon_log.stat().st_ino
+daemon_log.write_bytes(b"z" * 2000)
+common.rotate_log(daemon_log)
+check("輪替後仍是同一個 inode（沒有改名）", daemon_log.stat().st_ino == before_inode)
 
-config.DAEMON_LOG_MAX_BYTES, config.DAEMON_LOG_KEEP_BYTES = _real_max, _real_keep
-config.DAEMON_LOG_PATH.unlink(missing_ok=True)
+# monitor 每輪不只收 daemon 的 stderr：daemon 的 stdout 和本專案自己的 *.log 也要收，
+# 斷網時 bot.err.log 每 5 秒就多一行。
+project_log = config.LOG_DIR / "bot.err.log"
+for path in (config.DAEMON_OUT_LOG_PATH, project_log):
+    path.write_bytes(b"e" * 2000)
+run("rotate all logs")
+check("monitor 也會輪替 daemon 的 stdout", config.DAEMON_OUT_LOG_PATH.stat().st_size == 0)
+check("monitor 也會輪替專案自己的 *.log", project_log.stat().st_size == 0)
+
+config.LOG_MAX_BYTES, config.LOG_KEEP_BYTES = _real_max, _real_keep
+for path in (daemon_log, config.DAEMON_OUT_LOG_PATH, project_log):
+    path.unlink(missing_ok=True)
 
 # ------------------------------------------------------------------- 靜音
 

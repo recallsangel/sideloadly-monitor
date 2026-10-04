@@ -5,7 +5,7 @@
 每次執行都會更新 state.json 的 last_run，bot 端靠它判斷監控是否停擺。
 """
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import common
 import config
@@ -16,11 +16,17 @@ def main():
     if not config.SIDELOADLY_DB_PATH.exists():
         return
 
-    # 順手收 Sideloadly daemon 的日誌。不推播——這是例行家務，不是告警；
-    # 印出來就好，launchd 會收進 monitor.log。
-    rotated = common.rotate_daemon_log()
-    if rotated:
-        print(rotated, flush=True)
+    # 順手收日誌：Sideloadly daemon 的 stderr/stdout，加上本專案自己的 *.log。
+    # 不推播——這是例行家務，不是告警；印出來就好，launchd 會收進 monitor.log。
+    logs = [
+        config.DAEMON_ERR_LOG_PATH,
+        config.DAEMON_OUT_LOG_PATH,
+        *sorted(config.LOG_DIR.glob("*.log")),
+    ]
+    for path in logs:
+        rotated = common.rotate_log(path)
+        if rotated:
+            print(rotated, flush=True)
 
     prev_state = (
         json.loads(config.STATE_PATH.read_text()) if config.STATE_PATH.exists() else {}
@@ -32,7 +38,9 @@ def main():
     prev_overdue = prev_state.get("overdue_notified", {})
     prev_expired = prev_state.get("expired_notified", {})
     prev_offline = prev_state.get("device_offline_notified", {})
-    today = datetime.now(timezone.utc).date().isoformat()
+    # 「每天最多提醒一次」照本機時區換日。用 UTC 的話台灣是早上 8 點換日，
+    # 那前後一小時內可能收到兩次同樣的提醒。
+    today = date.today().isoformat()
 
     # 用 visible_* 而不是 fetch_*：被 /forget 忘記的裝置/app 不該再觸發告警。
     installs = common.visible_installs()

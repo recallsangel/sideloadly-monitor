@@ -79,7 +79,7 @@
 | 裝置回線 | 離線後又出現 |
 | 監控停擺 | `state.json` 的 `last_run` 超過 `HEARTBEAT_STALE_HOURS` 沒更新 |
 
-同一輪的變化會**併成一則訊息**，不會每個 app 各發一次。
+同一輪的變化會**併成一則訊息**，不會每個 app 各發一次。「每天」照本機時區換日。
 
 「刷新失敗」如果剛好碰上失敗那個 app 綁定的 Apple ID 本週 App ID 額度是 0，
 訊息會多一行提示，建議切去哪個還有額度的已綁定帳號（額度取自 `account-appids.json`，
@@ -312,9 +312,12 @@ tick 骨架。**卡點的樣子是某個 `Will tick` 後面沒有對應的 `Done
 
 ### 輪替
 
-那些雜訊讓日誌長得很快（實測約 200 MB/天），所以 `monitor.py` 每輪會呼叫
-`common.rotate_daemon_log()`：超過 `DAEMON_LOG_MAX_BYTES` 就把最後
-`DAEMON_LOG_KEEP_BYTES` 存成 `.1`，然後**原地清空**原檔。
+那些雜訊讓日誌長得很快（實測約 200 MB/天），所以 `monitor.py` 每輪會對每個日誌
+呼叫 `common.rotate_log()`：超過 `LOG_MAX_BYTES` 就把最後 `LOG_KEEP_BYTES` 存成
+`.1`，然後**原地清空**原檔。同一個上限也套在 daemon 的 stdout
+（`sideloadly-daemon.out.log`，LaunchAgent 有設 `StandardOutPath` 才有）和本專案
+三個 job 寫在專案目錄的 `*.log` 上——它們長得慢，但斷網時 `bot.err.log` 每 5 秒
+就多一行，一樣不該無限長。
 
 原地清空而不是改名，是因為 launchd 開著這個檔的 fd——改名的話 daemon 會繼續往
 改名後的那個 inode 寫，新建的檔永遠是空的。清空可行是因為 launchd 用 `O_APPEND`
@@ -328,6 +331,7 @@ tick 骨架。**卡點的樣子是某個 `Will tick` 後面沒有對應的 `Done
 - `mute_until.txt` — 靜音到期時間，存在才算靜音
 - `bot_offset.txt` — Telegram update offset
 - `forgotten.json` — `/forget` 忘記的裝置/app 清單（見上方「忘記某個裝置或 app」）
+- `*.log` — 三個 launchd job 的輸出，由 `monitor.py` 一起輪替（見上方「輪替」）
 
 ## 測試
 

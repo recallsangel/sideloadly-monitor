@@ -14,6 +14,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import config
 import forget
@@ -681,35 +682,34 @@ def perform_restart() -> tuple[bool, str]:
     )
 
 
-def rotate_daemon_log() -> str | None:
-    """Sideloadly daemon 的 stderr 超過上限就留一份尾巴、然後原地清空。
+def rotate_log(path: Path) -> str | None:
+    """launchd 寫的日誌超過上限就留一份尾巴、然後原地清空。
 
-    一定要「原地清空」而不是改名：launchd 開著這個檔的 fd，改名之後 daemon 會
+    一定要「原地清空」而不是改名：launchd 開著這個檔的 fd，改名之後行程會
     繼續往改名後的那個 inode 寫，新建的檔案永遠是空的。清空可以，因為 launchd
     是用 O_APPEND 開的，下一次寫入會自己回到檔頭接上。
 
     沒超過上限或檔案不存在回 None，做了事才回一句話。
     """
-    path = config.DAEMON_LOG_PATH
     try:
         size = path.stat().st_size
     except OSError:
         return None
-    if size <= config.DAEMON_LOG_MAX_BYTES:
+    if size <= config.LOG_MAX_BYTES:
         return None
 
     keep = path.with_name(path.name + ".1")
     try:
         with path.open("rb") as src:
-            src.seek(max(0, size - config.DAEMON_LOG_KEEP_BYTES))
+            src.seek(max(0, size - config.LOG_KEEP_BYTES))
             tail = src.read()
         keep.write_bytes(tail)
         with path.open("r+b") as dst:
             dst.truncate(0)
     except OSError as exc:
-        return f"daemon 日誌輪替失敗: {exc}"
+        return f"{path.name} 輪替失敗: {exc}"
     return (
-        f"daemon 日誌已清空（{_size_text(size)}），"
+        f"{path.name} 已清空（{_size_text(size)}），"
         f"最後 {_size_text(len(tail))} 留在 {keep.name}"
     )
 
