@@ -20,6 +20,8 @@ import config
 import forget
 
 _STATE_RE = re.compile(r"^\s*state = (\S+)", re.MULTILINE)
+_PID_RE = re.compile(r"^\s*pid = (\d+)", re.MULTILINE)
+_FOOTPRINT_RE = re.compile(r"Footprint: (\d+) B\b")
 
 # sideloadly 用 Go 的 zero time 當「沒有值」，不是 NULL。
 ZERO_TS_PREFIX = "0001-01-01"
@@ -650,17 +652,43 @@ def build_account_report() -> str:
 
 # ---------------------------------------------------------------- daemon
 
-def daemon_state() -> str | None:
-    """回傳 launchd 對 daemon 的 state 字串，服務不存在時回 None。"""
+def _launchctl_print() -> str | None:
+    """launchctl 對 daemon 的描述（state、pid 都在裡面），服務不存在時回 None。"""
     result = subprocess.run(
         ["launchctl", "print", f"gui/{os.getuid()}/{config.DAEMON_LABEL}"],
         capture_output=True,
         text=True,
     )
-    if result.returncode != 0:
+    return result.stdout if result.returncode == 0 else None
+
+
+def daemon_state() -> str | None:
+    """回傳 launchd 對 daemon 的 state 字串，服務不存在時回 None。"""
+    info = _launchctl_print()
+    if info is None:
         return None
-    match = _STATE_RE.search(result.stdout)
+    match = _STATE_RE.search(info)
     return match.group(1) if match else "unknown"
+
+
+def daemon_footprint() -> int | None:
+    """daemon 現在佔的記憶體（bytes），沒在跑或讀不到時回 None。
+
+    量的是 phys_footprint（「活動監視器」記憶體欄的那個數），不是 RSS：漏掉的
+    記憶體幾乎不會再被碰到，macOS 會把它壓縮或換進 swap，RSS 於是一直很小——
+    2026-10-09 footprint 8.2 GB 的時候 RSS 只有 0.09 GB。
+    """
+    info = _launchctl_print()
+    pid = _PID_RE.search(info) if info else None
+    if not pid:
+        return None
+    result = subprocess.run(
+        ["footprint", "-f", "bytes", "-p", pid.group(1)],
+        capture_output=True,
+        text=True,
+    )
+    match = _FOOTPRINT_RE.search(result.stdout)
+    return int(match.group(1)) if match else None
 
 
 def perform_restart() -> tuple[bool, str]:

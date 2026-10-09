@@ -7,6 +7,7 @@ daemon 正在刷新時把它打斷。加 --force 可以無視判斷直接重啟�
 import sys
 
 import common
+import config
 import history
 
 
@@ -24,6 +25,14 @@ def restart_reasons() -> tuple[list[str], list[str]]:
     state = common.daemon_state()
     if state != "running":
         reasons.append(f"daemon 不在執行中（state={state}）")
+
+    # daemon 會漏記憶體，而重啟是唯一放得掉它的辦法（見 config.DAEMON_MEMORY_LIMIT_BYTES）。
+    footprint = common.daemon_footprint()
+    if footprint is not None and footprint > config.DAEMON_MEMORY_LIMIT_BYTES:
+        reasons.append(
+            f"daemon 記憶體 {footprint / 1024**3:.1f} GB，"
+            f"超過 {config.DAEMON_MEMORY_LIMIT_BYTES / 1024**3:.0f} GB 上限"
+        )
 
     # visible_installs()，不是 fetch_installs()：一個被 /forget 忘記的裝置/app
     # 不該再逼著每天 4am 的自動重啟去處理它。

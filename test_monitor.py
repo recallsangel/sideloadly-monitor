@@ -462,6 +462,9 @@ check("/status 有問題時附帶重新部署按鈕", find_callback("redeploy:")
 import restart
 
 common.daemon_state = lambda: "running"
+# daemon_footprint 讀的是這台機器上真的在跑的那顆 daemon；不換掉的話，它當下漏了
+# 多少記憶體會混進下面每一個判斷。
+common.daemon_footprint = lambda: 100 * 1024**2
 ZERO_TS = "0001-01-01 00:00:00+00:00"
 SENTINEL = "測試用錯誤 xyzzy"
 
@@ -520,6 +523,38 @@ db("UPDATE installations SET last_failure_at = ? WHERE id = ?",
    ts(hours=-(config.FAILURE_STALE_HOURS + 1)), id2)
 check("錯誤變舊不會被誤報成錯誤已解除",
       "錯誤已解除" not in run("failure ages out"))
+
+# ------------------------------------------- daemon 記憶體洩漏
+
+# 2026-09-19 起 daemon 連跑 20 天沒被重啟過、footprint 長到 8.2 GB：上面那些理由
+# 沒有一個看記憶體，所以每天 04:00 都回「一切正常」。
+
+# 壓回健康狀態，記憶體才是唯一的變數。
+db("UPDATE installations SET last_updated = ?, last_error = '', "
+   "failures_count = 0, last_failure_at = ?", ts(hours=-2), ZERO_TS)
+
+
+def memory_reasons(footprint):
+    common.daemon_footprint = lambda: footprint
+    reasons, _ = restart.restart_reasons()
+    return [r for r in reasons if "記憶體" in r]
+
+
+check("記憶體超過上限算重啟理由", memory_reasons(config.DAEMON_MEMORY_LIMIT_BYTES + 1))
+check("剛好在上限不算", not memory_reasons(config.DAEMON_MEMORY_LIMIT_BYTES))
+check("讀不到記憶體時不因此重啟", not memory_reasons(None))
+
+restarted.clear()
+common.daemon_footprint = lambda: 8 * 1024**3
+restart.main()
+check("只有記憶體超標時 main() 也會重啟", restarted)
+common.daemon_footprint = lambda: 100 * 1024**2
+
+check("footprint -f bytes 的輸出解析得出來",
+      common._FOOTPRINT_RE.search(
+          "sideloadly-daemon [123]: 64-bit (translated)    "
+          "Footprint: 8769042560 B (4096 bytes per page)"
+      ).group(1) == "8769042560")
 
 # ------------------------------------------- 沒有任何 app 時照樣要推送
 

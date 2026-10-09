@@ -66,6 +66,17 @@
 （`Cancelled（1 次，2.3 天前，等下次刷新才會清）`），不會給重新部署按鈕——
 真的想手動重來一次仍然可以走 `/redeploy`，那支列的是全部的 app。
 
+## daemon 記憶體洩漏
+
+Sideloadly daemon 會漏記憶體：2026-09-19 啟動後連跑 20 天，到 10-09 footprint
+長到 8.2 GB（約每天 +400 MB），16 GB 的機器被它擠得天天用 swap。當時
+`restart.py` 的理由沒有一個看記憶體，所以那 20 天每天 04:00 都回「一切正常」。
+
+現在 footprint 超過 `DAEMON_MEMORY_LIMIT_BYTES`（3 GB，約漏一週的量）也算重啟
+理由。量的是 phys_footprint（`footprint -f bytes -p <pid>`，就是「活動監視器」
+記憶體欄的數字）而不是 RSS：漏掉的記憶體幾乎不會再被碰到，macOS 會把它壓縮或
+換進 swap，8.2 GB 那天 RSS 只有 0.09 GB，看 RSS 永遠不會觸發。
+
 ## 告警項目
 
 | 事件 | 觸發條件 |

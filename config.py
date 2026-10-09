@@ -67,6 +67,14 @@ DEVICE_OFFLINE_HOURS = 24
 # 約 3.7 小時的那次重啟救回來的，所以也不能短到把它排除掉。
 FAILURE_STALE_HOURS = 12
 
+# daemon 的記憶體（footprint）超過這個值，restart.py 就把它算成重啟理由。
+#
+# daemon 會漏記憶體：2026-09-19 啟動後連跑 20 天，到 10-09 長到 8.2 GB（約每天
+# +400 MB），16 GB 的機器被它擠得天天用 swap。上面那些理由沒有一個看記憶體，所以
+# 那 20 天每天 04:00 都回「一切正常」。3 GB 大約是漏一週的量，也就是每週最多多
+# 重啟一次——偶爾打斷一次刷新，比整台天天換頁划算。
+DAEMON_MEMORY_LIMIT_BYTES = 3 * 1024**3
+
 # monitor 每小時跑一次；state.json 的 last_run 超過這麼久沒更新，
 # 代表監控自己死了（launchd job 掛掉、Mac 睡著、python 噴錯）。
 HEARTBEAT_STALE_HOURS = 3
