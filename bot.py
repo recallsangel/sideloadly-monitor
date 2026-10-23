@@ -396,8 +396,8 @@ def main():
     if config.BOT_OFFSET_PATH.exists():
         offset = int(config.BOT_OFFSET_PATH.read_text().strip() or 0)
     if common.api("setMyCommands", commands=BOT_COMMANDS):
-        print("已註冊指令選單", flush=True)
-    print(f"sideloadly bot 啟動，offset={offset}", flush=True)
+        common.log("已註冊指令選單")
+    common.log(f"sideloadly bot 啟動，offset={offset}")
 
     while True:
         # HTTP 的逾時要比 long polling 長，否則沒有新訊息的每一輪都會變成逾時錯誤。
@@ -416,13 +416,13 @@ def main():
                 elif "callback_query" in update:
                     handle_callback(update["callback_query"])
             except Exception as exc:
-                print(f"處理 update 失敗: {exc}", file=sys.stderr, flush=True)
+                common.log(f"處理 update 失敗: {exc}", file=sys.stderr)
         config.BOT_OFFSET_PATH.write_text(str(offset))
 
         try:
             check_heartbeat()
         except Exception as exc:
-            print(f"心跳檢查失敗: {exc}", file=sys.stderr, flush=True)
+            common.log(f"心跳檢查失敗: {exc}", file=sys.stderr)
 
 
 if __name__ == "__main__":

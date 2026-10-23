@@ -3,6 +3,7 @@
 
 每天 4am 由 launchd 呼叫，但只在真的有問題時才動手——無條件重啟會在
 daemon 正在刷新時把它打斷。加 --force 可以無視判斷直接重啟。
+monitor 每小時看到 daemon 沒在跑時也會呼叫 main()，不必等到 4am。
 """
 import sys
 
@@ -49,30 +50,32 @@ def restart_reasons() -> tuple[list[str], list[str]]:
     return reasons, stale
 
 
-def main():
+def main(source: str | None = None):
+    """source 是 4am 這支以外的呼叫者（目前只有 monitor），會記進重啟紀錄。"""
     force = "--force" in sys.argv[1:]
     reasons, stale = restart_reasons()
 
     # 舊帳只進 log，不推播也不重啟：它沒有變化，而每天為它發一則通知就是把
     # 「有事發生」的意思磨掉。
     for item in stale:
-        print(f"（重啟解不掉，略過）{item}")
+        common.log(f"（重啟解不掉，略過）{item}")
 
     if not force and not reasons:
-        print("沒有重啟解得掉的問題，不重啟。" if stale else "一切正常，不重啟。")
+        common.log("沒有重啟解得掉的問題，不重啟。" if stale else "一切正常，不重啟。")
         return
 
     if force:
-        print("--force：略過判斷直接重啟。")
+        common.log("--force：略過判斷直接重啟。")
     else:
-        print("需要重啟的原因：")
+        common.log("需要重啟的原因：")
         for reason in reasons:
-            print(f"  - {reason}")
+            common.log(f"  - {reason}")
 
     ok, message = common.perform_restart()
-    print(message)
+    common.log(message)
 
-    history.record_restart(ok, message, "; ".join(reasons) if reasons else "force")
+    why = "; ".join(reasons) if reasons else "force"
+    history.record_restart(ok, message, f"{source}，{why}" if source else why)
 
     body = message if force else message + "\n\n原因：\n" + "\n".join(
         f"· {r}" for r in reasons

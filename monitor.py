@@ -2,6 +2,7 @@
 """每小時比對 sideloadly 資料庫，把變化彙整成一則通知推出去。
 
 偵測項目：刷新完成、刷新失敗、錯誤解除、逾期未刷新、已過期、裝置離線/回線。
+daemon 沒在跑的話當場重啟，不等 04:00 的 restart.py。
 每次執行都會更新 state.json 的 last_run，bot 端靠它判斷監控是否停擺。
 """
 import json
@@ -10,6 +11,7 @@ from datetime import date, datetime, timezone
 import common
 import config
 import history
+import restart
 
 
 def main():
@@ -26,7 +28,16 @@ def main():
     for path in logs:
         rotated = common.rotate_log(path)
         if rotated:
-            print(rotated, flush=True)
+            common.log(rotated)
+
+    # daemon 停了就沒人在刷新。04:00 的 restart.py 也會把它拉起來，但最久要等將近一天：
+    # 2026-10-21 00:38 它跟著 Sideloadly 主程式一起結束（它的 LaunchAgent 沒設
+    # KeepAlive），停了 3.4 小時才被 04:00 那支救回。啟動一顆沒在跑的 daemon 不會打斷
+    # 任何刷新，所以每小時看一次，停了就提早跑 restart.py 那一套。
+    # 查不到服務（None）代表它根本沒載入，那通常是刻意卸載的；硬要重啟只會每小時推一次失敗。
+    daemon_state = common.daemon_state()
+    if daemon_state is not None and daemon_state != "running":
+        restart.main(source="monitor")
 
     prev_state = (
         json.loads(config.STATE_PATH.read_text()) if config.STATE_PATH.exists() else {}

@@ -2,11 +2,15 @@
 """偵測邏輯的端對端測試。
 
 在複製出來的資料庫上跑，state / events / mute 都指到暫存目錄，
-send_message 被換掉，所以不會碰真實狀態也不會發 Telegram。
+send_message 與 daemon 的查詢、重啟都被換掉，所以不會碰真實狀態、不會發
+Telegram，也不會重啟真的 daemon。
 
 用法：./test_monitor.py [-v]
 """
+import contextlib
+import io
 import json
+import re
 import shutil
 import sqlite3
 import sys
@@ -42,6 +46,7 @@ import common
 import forget
 import history
 import monitor
+import restart
 
 SENT: list[dict] = []
 
@@ -53,6 +58,14 @@ def fake_api(method, **params):
 
 
 common.api = fake_api
+
+# monitor.main() 每輪都會看 daemon 有沒有在跑，沒在跑就當場重啟——不在第一次
+# monitor.main() 之前換掉，測試當下 daemon 剛好停著的話就會真的去重啟它。要測哪種
+# 狀況再個別改。daemon_footprint 讀的也是這台機器上真的在跑的那顆 daemon；不換掉的話，
+# 它當下漏了多少記憶體會混進 restart.py 的每一個判斷。
+common.daemon_state = lambda: "running"
+common.daemon_footprint = lambda: 100 * 1024**2
+common.perform_restart = lambda: (True, "已重啟（測試）")
 
 
 def sent_text() -> str:
@@ -214,6 +227,13 @@ config.LOG_MAX_BYTES, config.LOG_KEEP_BYTES = _real_max, _real_keep
 for path in (daemon_log, config.DAEMON_OUT_LOG_PATH, project_log):
     path.unlink(missing_ok=True)
 
+# 這些 *.log 沒有別的時間來源：沒有時間戳就分不出是哪天斷的網、哪天重啟的。
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    common.log("測試訊息")
+check("日誌每行開頭帶本機時間",
+      re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} 測試訊息\n", buf.getvalue()))
+
 # ------------------------------------------------------------------- 靜音
 
 common.set_mute(1)
@@ -301,8 +321,6 @@ def say(text: str):
         "text": text,
     })
 
-
-common.perform_restart = lambda: (True, "已重啟（測試）")
 
 say("/menu")
 check("/menu 送出選單", "選單" in sent_text())
@@ -459,12 +477,6 @@ check("/status 有問題時附帶重新部署按鈕", find_callback("redeploy:")
 # Sideloadly 要到下一次刷新成功才會清掉錯誤旗標，而下一次刷新排在 96 小時後，
 # 於是旗標亮著的每一天都變成一個「需要重啟的原因」，而重啟一件都解決不了。
 
-import restart
-
-common.daemon_state = lambda: "running"
-# daemon_footprint 讀的是這台機器上真的在跑的那顆 daemon；不換掉的話，它當下漏了
-# 多少記憶體會混進下面每一個判斷。
-common.daemon_footprint = lambda: 100 * 1024**2
 ZERO_TS = "0001-01-01 00:00:00+00:00"
 SENTINEL = "測試用錯誤 xyzzy"
 
@@ -555,6 +567,34 @@ check("footprint -f bytes 的輸出解析得出來",
           "sideloadly-daemon [123]: 64-bit (translated)    "
           "Footprint: 8769042560 B (4096 bytes per page)"
       ).group(1) == "8769042560")
+
+# ------------------------------------------- daemon 停了不必等到 04:00
+
+# 2026-10-21 00:38 daemon 跟著 Sideloadly 主程式一起結束，它的 LaunchAgent 沒設
+# KeepAlive，一直停到 04:00 restart.py 才被拉起來，中間 3.4 小時沒有任何告警。
+check("launchctl 的 state 整行都抓到（沒在跑時是 not running 兩個字）",
+      common._STATE_RE.search(
+          "gui/501/io.sideloadly.daemon = {\n\tactive count = 0\n"
+          "\tstate = not running\n\n\tprogram = /x\n"
+      ).group(1) == "not running")
+
+restarted.clear()
+common.daemon_state = lambda: "not running"
+body = run("daemon down")
+check("monitor 看到 daemon 沒在跑就當場重啟", restarted)
+check("重啟通知寫出原因", "daemon 不在執行中（state=not running）" in body)
+check("重啟紀錄點名是 monitor 動的手",
+      "| monitor，" in history.recent(1, kinds=["restart"])[0]["detail"])
+
+restarted.clear()
+common.daemon_state = lambda: None
+run("daemon not loaded")
+check("服務根本沒載入時 monitor 不去重啟", not restarted)
+
+restarted.clear()
+common.daemon_state = lambda: "running"
+run("daemon running")
+check("daemon 在跑時 monitor 不重啟", not restarted)
 
 # ------------------------------------------- 沒有任何 app 時照樣要推送
 

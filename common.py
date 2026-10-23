@@ -19,12 +19,25 @@ from pathlib import Path
 import config
 import forget
 
-_STATE_RE = re.compile(r"^\s*state = (\S+)", re.MULTILINE)
+# 整行都要抓：沒在跑時是「not running」兩個字，只抓第一個字會變成 state=not。
+_STATE_RE = re.compile(r"^\s*state = (.+)$", re.MULTILINE)
 _PID_RE = re.compile(r"^\s*pid = (\d+)", re.MULTILINE)
 _FOOTPRINT_RE = re.compile(r"Footprint: (\d+) B\b")
 
 # sideloadly 用 Go 的 zero time 當「沒有值」，不是 NULL。
 ZERO_TS_PREFIX = "0001-01-01"
+
+
+# ------------------------------------------------------------------- 日誌
+
+def log(message: str, file=None):
+    """印進 launchd 收的 *.log，開頭加上本機時間。
+
+    這些日誌沒有別的時間來源：2026-10-23 回頭查 bot.err.log 裡三千多筆斷線，
+    完全分不出是哪天斷的，只能拿系統日誌回推，而系統日誌只留一天多。
+    file 預設取呼叫當下的 sys.stdout，測試換掉 stdout 才攔得到。
+    """
+    print(f"{datetime.now():%Y-%m-%d %H:%M:%S} {message}", file=file or sys.stdout, flush=True)
 
 
 # ---------------------------------------------------------------- Telegram
@@ -54,7 +67,7 @@ def api(method: str, http_timeout: float = 15, **params) -> dict | None:
     except (OSError, ValueError, http.client.HTTPException) as exc:
         # OSError 涵蓋連線錯誤與 HTTP 錯誤碼；ValueError 是回應不是 JSON；
         # HTTPException（例如讀到一半斷線的 IncompleteRead）不是 OSError，要另外接。
-        print(f"{method} 失敗: {exc}", file=sys.stderr, flush=True)
+        log(f"{method} 失敗: {exc}", file=sys.stderr)
         return None
 
 

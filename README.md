@@ -11,7 +11,7 @@
 
 | Job | 頻率 | 做什麼 |
 | --- | --- | --- |
-| `com.example.sideloadly-monitor` | 每小時 | `monitor.py` 比對資料庫，把變化彙整成一則通知 |
+| `com.example.sideloadly-monitor` | 每小時 | `monitor.py` 比對資料庫，把變化彙整成一則通知；daemon 沒在跑就當場重啟 |
 | `com.example.sideloadly-bot` | 常駐 | `bot.py` 處理 Telegram 指令，兼任監控看門狗 |
 | `com.example.sideloadly-daily-restart` | 每天 04:00 | `restart.py` 只在重啟解得掉的問題上動手 |
 
@@ -77,6 +77,21 @@ Sideloadly daemon 會漏記憶體：2026-09-19 啟動後連跑 20 天，到 10-0
 記憶體欄的數字）而不是 RSS：漏掉的記憶體幾乎不會再被碰到，macOS 會把它壓縮或
 換進 swap，8.2 GB 那天 RSS 只有 0.09 GB，看 RSS 永遠不會觸發。
 
+## daemon 被關掉
+
+Sideloadly daemon 的 LaunchAgent 沒設 `KeepAlive`，它一結束就沒人拉起來。
+2026-10-21 00:38 它跟著 Sideloadly 主程式一起正常結束（exit 0，不是當掉），一直停到
+04:00 `restart.py` 看到「daemon 不在執行中」才重啟，中間 3.4 小時沒有任何告警。
+
+所以 `monitor.py` 每小時也會看一次 daemon 的 state，沒在跑就當場跑一次 `restart.py`
+的流程（重啟、記進歷史、推播），空窗從最多將近一天縮到一小時。啟動一顆沒在跑的
+daemon 不會打斷任何刷新，跟「不要無條件重啟」不衝突；記憶體、逾期、錯誤旗標這些
+理由仍然只有 04:00 那支會為它們重啟。沒有改去 Sideloadly 自己的 LaunchAgent 設
+`KeepAlive`：那份檔案是 Sideloadly 的，而且那樣重啟了也不會留紀錄、不會通知。
+
+服務根本沒載入（`launchctl print` 查不到它）時 monitor 不動手：那通常是刻意卸載的，
+硬要重啟只會每小時推一次失敗。
+
 ## 告警項目
 
 | 事件 | 觸發條件 |
@@ -89,6 +104,7 @@ Sideloadly daemon 會漏記憶體：2026-09-19 啟動後連跑 20 天，到 10-0
 | 裝置離線 | `devices.last_seen` 超過 `DEVICE_OFFLINE_HOURS` |
 | 裝置回線 | 離線後又出現 |
 | 監控停擺 | `state.json` 的 `last_run` 超過 `HEARTBEAT_STALE_HOURS` 沒更新 |
+| daemon 重啟 | daemon 已載入但沒在跑（monitor 當場重啟，另發一則通知），或 04:00 `restart.py` 有理由重啟 |
 
 同一輪的變化會**併成一則訊息**，不會每個 app 各發一次。「每天」照本機時區換日。
 
@@ -342,7 +358,7 @@ tick 骨架。**卡點的樣子是某個 `Will tick` 後面沒有對應的 `Done
 - `mute_until.txt` — 靜音到期時間，存在才算靜音
 - `bot_offset.txt` — Telegram update offset
 - `forgotten.json` — `/forget` 忘記的裝置/app 清單（見上方「忘記某個裝置或 app」）
-- `*.log` — 三個 launchd job 的輸出，由 `monitor.py` 一起輪替（見上方「輪替」）
+- `*.log` — 三個 launchd job 的輸出，每行開頭有本機時間，由 `monitor.py` 一起輪替（見上方「輪替」）
 
 ## 測試
 
