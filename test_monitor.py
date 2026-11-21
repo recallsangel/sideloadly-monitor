@@ -740,6 +740,33 @@ run("usbmuxd reattached")
 check("重新接上就從 state.json 拿掉",
       LOST_MAC not in json.loads(config.STATE_PATH.read_text())["usbmuxd_drops"])
 
+
+# 裝置換了 Wi-Fi MAC 之後是用新 MAC 接上，舊 MAC 那筆等不到接上的日誌，只能靠天數清掉。
+# 紀錄是上一輪帶下來的，不是這一輪的日誌：實際上 monitor 最多只往回讀 24 小時。
+def carry_drop(days):
+    reset_usbmuxd_state()
+    state = json.loads(config.STATE_PATH.read_text())
+    state["usbmuxd_drops"] = {
+        LOST_MAC: {"instance": LOST_INSTANCE, "dropped_at": usbmuxd_ts(days=days), "udid": None}
+    }
+    config.STATE_PATH.write_text(json.dumps(state))
+
+
+USBMUXD_EVENTS.clear()
+resolved = []
+common.wifi_sync_host = lambda instance: resolved.append(instance) or LOST_HOST
+carry_drop(-(config.USBMUXD_DROP_FORGET_DAYS + 1))
+body = run("usbmuxd stale drop")
+check("弄丟超過 USBMUXD_DROP_FORGET_DAYS 天就從 state.json 拿掉",
+      LOST_MAC not in json.loads(config.STATE_PATH.read_text())["usbmuxd_drops"])
+check("拿掉的那筆不再用 dns-sd 問，也不告警", not resolved and LOST_HEADING not in body)
+
+carry_drop(-(config.USBMUXD_DROP_FORGET_DAYS - 1))
+body = run("usbmuxd old drop within limit")
+check("還沒到天數的照樣帶著、照樣告警",
+      LOST_MAC in json.loads(config.STATE_PATH.read_text())["usbmuxd_drops"]
+      and LOST_HEADING in body)
+
 USBMUXD_EVENTS.clear()
 common.wifi_sync_host = lambda instance: None
 

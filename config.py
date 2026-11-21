@@ -114,6 +114,16 @@ USBMUXD_LOG_MAX_HOURS = 24
 # 用 dns-sd -L 確認被弄丟的裝置還在 Wi-Fi 上，等它回應最多等幾秒。還在的裝置一秒內
 # 就回；不在的要等到逾時，而 dns-sd 自己不會結束，一定會等滿這麼久。
 BONJOUR_RESOLVE_SECONDS = 3
+# 弄丟的紀錄最多帶幾天，超過就從 state.json 拿掉，不管它接回來了沒。
+#
+# 裝置的 Wi-Fi MAC 會換（iOS 的私人 Wi-Fi 位址）：iPhone +1 11-14 被弄丟時是
+# 9b:b3:…，11-21 已經換成 e6:33:…；iPhone Air 11-19 的 9a:93:… 也換掉了。換了 MAC
+# 的裝置是用新 MAC 接上，舊 MAC 那筆永遠等不到接上的日誌，只會一直留著，而每一筆每輪
+# 都要等 dns-sd -L 逾時（BONJOUR_RESOLVE_SECONDS）才知道它不在。2026-11-21 的
+# state.json 已經留了 11-10、11-14、11-19 三筆，monitor 每輪白等 9 秒。
+# 7 天：免費憑證只有 7 天，真的卡這麼久還沒接回來的裝置，上面的 app 也已經過期，改由
+# 過期告警接手；這段期間弄丟告警也每天提醒過了。
+USBMUXD_DROP_FORGET_DAYS = 7
 
 # perform_restart() 送出 kickstart 後，隔多久確認一次 daemon 有沒有回到 running。
 RESTART_VERIFY_ATTEMPTS = 5

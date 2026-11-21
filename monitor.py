@@ -151,10 +151,18 @@ def main():
     usbmuxd_drops = common.track_usbmuxd_drops(
         prev_state.get("usbmuxd_drops", {}), common.usbmuxd_log(since)
     )
+    # 弄丟太久的不再帶著，見 config.USBMUXD_DROP_FORGET_DAYS 上方說明。時間讀不出來的
+    # 那筆永遠不會告警、也永遠等不到這個期限，一起拿掉。
+    forget_before = now - timedelta(days=config.USBMUXD_DROP_FORGET_DAYS)
+    usbmuxd_drops = {
+        mac: drop
+        for mac, drop in usbmuxd_drops.items()
+        if (dropped_at := common.parse_ts(drop["dropped_at"])) and dropped_at >= forget_before
+    }
     devices_by_udid = {d.udid: d for d in devices}
     for mac, drop in usbmuxd_drops.items():
         dropped_at = common.parse_ts(drop["dropped_at"])
-        if dropped_at is None or now - dropped_at < timedelta(minutes=config.USBMUXD_DROP_MINUTES):
+        if now - dropped_at < timedelta(minutes=config.USBMUXD_DROP_MINUTES):
             continue
         # 認得出是哪台、卻不在 visible_devices 裡：被 /forget 忘記了，或者根本不是
         # Sideloadly 在用的裝置，它接不接得回來都跟刷新無關。
