@@ -67,6 +67,20 @@ DEVICE_OFFLINE_HOURS = 24
 # 約 3.7 小時的那次重啟救回來的，所以也不能短到把它排除掉。
 FAILURE_STALE_HOURS = 12
 
+# 重啟 daemon 解不掉的兩種失敗。restart.py 不拿它們當重啟理由，/status 也不給
+# 重新部署按鈕（那顆按鈕做的就是重啟）。
+#
+# 1. failures_count 到 SIDELOADLY_GIVE_UP_FAILURES：Sideloadly daemon 從此每次 tick
+#    都印「This app is in Failed state, ignoring」，不再重試。計數存在資料庫裡，
+#    重啟不會歸零——2026-11-08～09 daemon 重啟過三次，那幾個 app 照樣每次被略過。
+#    門檻 3 是觀察來的：failures_count 1 的 app 沒被略過，3 的全被略過。
+# 2. last_error 含 RESTART_CANT_FIX_ERRORS 任一字串：毛病在 anisette（Apple 登入
+#    要的裝置驗證資料），不在 daemon。2026-11-09 04:00 為「Anisette failed: No OTP」
+#    重啟過一次，什麼都沒解決；根因是 macOS 27 擋掉 Local Anisette，要到 Sideloadly
+#    設定改 anisette 模式。
+SIDELOADLY_GIVE_UP_FAILURES = 3
+RESTART_CANT_FIX_ERRORS = ("Anisette failed",)
+
 # daemon 的記憶體（footprint）超過這個值，restart.py 就把它算成重啟理由。
 #
 # daemon 會漏記憶體：2026-09-19 啟動後連跑 20 天，到 10-09 長到 8.2 GB（約每天
@@ -80,6 +94,26 @@ DAEMON_MEMORY_LIMIT_BYTES = 3 * 1024**3
 HEARTBEAT_STALE_HOURS = 3
 # 心跳告警的重複提醒間隔，避免監控長期掛著時每 30 秒轟炸一次。
 HEARTBEAT_REPEAT_HOURS = 6
+
+# ---------------------------------------------------------------- usbmuxd
+# usbmuxd 是 macOS 管 iPhone/iPad 連線（USB 與 Wi-Fi）的系統服務，Sideloadly 透過它
+# 找裝置。它偶爾會把一台還在 Wi-Fi 上的裝置弄丟：確認那台裝置的 Bonjour 紀錄時
+# 出錯（日誌「DNSServiceReconfirmRecord(<MAC>@…) failed -65541」，緊接著斷線），之後
+# 只有那台裝置「重新出現」在 Bonjour 上才會被接回來——一直待在 Wi-Fi 上的手機
+# 不會重新出現，於是一直接不回來，Sideloadly 也就一直看不到它。2026-11-09 23:22
+# Joy 就是這樣卡了半小時，到期前的刷新跟著失敗，`sudo killall usbmuxd` 之後立刻接回。
+#
+# 弄丟超過這麼久才告警：同一種錯誤 11-08～09 出現 5 次，另外 4 次都自己接回來了，
+# 3 次在 3、10、38 分鐘內（裝置離開又回到 Wi-Fi），1 次隔了 6 小時（那段時間它在不在
+# Wi-Fi 上已經查不到）。太早告警只會叫人去按一顆不必按的按鈕；還沒接回來的裝置也
+# 要先確認它真的還在 Wi-Fi 上才告警，見 BONJOUR_RESOLVE_SECONDS。
+USBMUXD_DROP_MINUTES = 30
+# 第一次跑、或 monitor 停過一陣子時，最多往回讀多久的 usbmuxd 日誌。平常只讀上一輪
+# 之後的部分，但 24 小時也只要 8 秒左右。
+USBMUXD_LOG_MAX_HOURS = 24
+# 用 dns-sd -L 確認被弄丟的裝置還在 Wi-Fi 上，等它回應最多等幾秒。還在的裝置一秒內
+# 就回；不在的要等到逾時，而 dns-sd 自己不會結束，一定會等滿這麼久。
+BONJOUR_RESOLVE_SECONDS = 3
 
 # perform_restart() 送出 kickstart 後，隔多久確認一次 daemon 有沒有回到 running。
 RESTART_VERIFY_ATTEMPTS = 5

@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """每小時比對 sideloadly 資料庫，把變化彙整成一則通知推出去。
 
-偵測項目：刷新完成、刷新失敗、錯誤解除、逾期未刷新、已過期、裝置離線/回線。
+偵測項目：刷新完成、刷新失敗、錯誤解除、逾期未刷新、已過期、裝置離線/回線、
+usbmuxd 弄丟了還在 Wi-Fi 上的裝置（附一顆重啟 usbmuxd 的按鈕）。
 daemon 沒在跑的話當場重啟，不等 04:00 的 restart.py。
 每次執行都會更新 state.json 的 last_run，bot 端靠它判斷監控是否停擺。
 """
 import json
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import common
 import config
 import history
 import restart
+
+USBMUXD_KEYBOARD = {
+    "inline_keyboard": [[{"text": "🔌 重啟 usbmuxd", "callback_data": "usbmuxd"}]]
+}
 
 
 def main():
@@ -49,6 +54,7 @@ def main():
     prev_overdue = prev_state.get("overdue_notified", {})
     prev_expired = prev_state.get("expired_notified", {})
     prev_offline = prev_state.get("device_offline_notified", {})
+    prev_usbmuxd = prev_state.get("usbmuxd_notified", {})
     # 「每天最多提醒一次」照本機時區換日。用 UTC 的話台灣是早上 8 點換日，
     # 那前後一小時內可能收到兩次同樣的提醒。
     today = date.today().isoformat()
@@ -59,10 +65,11 @@ def main():
     quotas = common.fetch_account_quotas()
 
     refreshed, failed, recovered, overdue, expired = [], [], [], [], []
-    offline, back_online = [], []
+    offline, back_online, lost = [], [], []
     # 新的 state 每輪從頭建，資料庫裡已經沒有（或被忘記）的 app 與裝置就不會留下來。
     # 留著的話快照只會一直累積，Sideloadly 重用 id 時還會把新 app 誤判成刷新完成。
     snapshot, overdue_notified, expired_notified, device_offline_notified = {}, {}, {}, {}
+    usbmuxd_notified = {}
 
     for inst in installs:
         prev = prev_installs.get(inst.id, {})
@@ -134,6 +141,38 @@ def main():
             back_online.append(f"  · {device.name}")
             history.record("device_online", device.name)
 
+    # usbmuxd 弄丟的裝置，見 config.USBMUXD_DROP_MINUTES 上方說明。每輪只讀上一輪之後
+    # 的日誌，所以弄丟的紀錄要存進 state.json 一路帶著，直到它重新接上。多往回讀 10
+    # 分鐘，是為了不漏掉上一輪讀完日誌到寫下 last_run 之間的那幾秒。
+    now = datetime.now(timezone.utc)
+    oldest = now - timedelta(hours=config.USBMUXD_LOG_MAX_HOURS)
+    last_run = common.parse_ts(prev_state.get("last_run"))
+    since = max(last_run - timedelta(minutes=10), oldest) if last_run else oldest
+    usbmuxd_drops = common.track_usbmuxd_drops(
+        prev_state.get("usbmuxd_drops", {}), common.usbmuxd_log(since)
+    )
+    devices_by_udid = {d.udid: d for d in devices}
+    for mac, drop in usbmuxd_drops.items():
+        dropped_at = common.parse_ts(drop["dropped_at"])
+        if dropped_at is None or now - dropped_at < timedelta(minutes=config.USBMUXD_DROP_MINUTES):
+            continue
+        # 認得出是哪台、卻不在 visible_devices 裡：被 /forget 忘記了，或者根本不是
+        # Sideloadly 在用的裝置，它接不接得回來都跟刷新無關。
+        if drop["udid"] and drop["udid"] not in devices_by_udid:
+            continue
+        # 裝置真的離開 Wi-Fi 時也會留下同一筆錯誤，那種重啟 usbmuxd 也接不回來。
+        host = common.wifi_sync_host(drop["instance"])
+        if host is None:
+            continue
+        name = devices_by_udid[drop["udid"]].name if drop["udid"] else host
+        lost_for = common.human_delta((now - dropped_at).total_seconds())
+        usbmuxd_notified[mac] = today
+        if prev_usbmuxd.get(mac) != today:
+            lost.append(f"  · {name}：已經 {lost_for}沒接上，但它還在 Wi-Fi 上")
+            history.record("usbmuxd_drop", name, detail=f"已經 {lost_for}沒接上")
+    if lost:
+        lost.append("    ↳ 按下面的按鈕重啟 usbmuxd 就會接回來（其他裝置也會斷線幾秒）")
+
     config.STATE_PATH.write_text(
         json.dumps(
             {
@@ -141,6 +180,8 @@ def main():
                 "overdue_notified": overdue_notified,
                 "expired_notified": expired_notified,
                 "device_offline_notified": device_offline_notified,
+                "usbmuxd_drops": usbmuxd_drops,
+                "usbmuxd_notified": usbmuxd_notified,
                 "last_run": datetime.now(timezone.utc).isoformat(),
             },
             indent=2,
@@ -155,6 +196,7 @@ def main():
         (common.EXPIRED_HEADING, expired),
         (common.FAILING_HEADING, failed),
         (common.OVERDUE_HEADING, overdue),
+        ("🔌 Mac 弄丟了 Wi-Fi 上的裝置", lost),
         (common.OFFLINE_HEADING, offline),
         ("✅ 刷新完成", refreshed),
         ("🔄 錯誤已解除", recovered),
@@ -166,7 +208,11 @@ def main():
             body.append(title)
             body.extend(items)
     if body:
-        common.notify("Sideloadly 監控", "\n".join(body))
+        common.notify(
+            "Sideloadly 監控",
+            "\n".join(body),
+            reply_markup=USBMUXD_KEYBOARD if lost else None,
+        )
 
 
 if __name__ == "__main__":

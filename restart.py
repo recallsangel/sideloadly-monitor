@@ -38,6 +38,10 @@ def restart_reasons() -> tuple[list[str], list[str]]:
     # visible_installs()，不是 fetch_installs()：一個被 /forget 忘記的裝置/app
     # 不該再逼著每天 4am 的自動重啟去處理它。
     for inst in common.visible_installs():
+        # 它的過期、逾期也是同一個毛病造成的，重啟一樣救不回來。
+        if inst.restart_cant_fix:
+            stale.append(f"{inst.label} 重啟解不掉：{inst.failure_text()}")
+            continue
         if inst.expired:
             reasons.append(f"{inst.label} {inst.expiry_text()}")
         elif inst.overdue:

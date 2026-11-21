@@ -112,11 +112,11 @@ def _chunk(text: str, limit: int) -> list[str]:
     return chunks
 
 
-def notify(title: str, message: str):
+def notify(title: str, message: str, reply_markup=None):
     """主動推送。靜音期間會被丟掉（bot 回覆請直接用 send_message）。"""
     if mute_remaining() is not None:
         return
-    send_message(f"{title}\n{message}")
+    send_message(f"{title}\n{message}", reply_markup=reply_markup)
 
 
 # ------------------------------------------------------------------- 靜音
@@ -260,9 +260,21 @@ class Install:
         return age > config.FAILURE_STALE_HOURS
 
     @property
+    def daemon_gave_up(self) -> bool:
+        """Sideloadly daemon 已經不再重試這個 app，見 config.SIDELOADLY_GIVE_UP_FAILURES。"""
+        return self.failures_count >= config.SIDELOADLY_GIVE_UP_FAILURES
+
+    @property
+    def restart_cant_fix(self) -> bool:
+        """重啟 daemon 也救不回來的失敗，見 config.RESTART_CANT_FIX_ERRORS 上方說明。"""
+        return self.daemon_gave_up or any(
+            s in (self.last_error or "") for s in config.RESTART_CANT_FIX_ERRORS
+        )
+
+    @property
     def failing_now(self) -> bool:
         """重啟 daemon 有機會幫上忙的那一種失敗：最近還在發生。"""
-        return self.failing and not self.stale_failure
+        return self.failing and not self.stale_failure and not self.restart_cant_fix
 
     @property
     def label(self) -> str:
@@ -274,7 +286,10 @@ class Install:
         text = f"{self.last_error or '未知錯誤'}（{self.failures_count} 次"
         if self.last_failure_at:
             text += f"，{ago(self.last_failure_at)}"
-        if self.stale_failure:
+        # 已放棄的 app 沒有「下次刷新」，照舊說「等下次刷新才會清」會讓人以為等著就好。
+        if self.daemon_gave_up:
+            text += "，Sideloadly 已停止重試"
+        elif self.stale_failure:
             text += "，等下次刷新才會清"
         return text + "）"
 
@@ -593,7 +608,9 @@ def status_action_keyboard() -> dict | None:
     # 而重啟既清不掉錯誤旗標也不會讓刷新提早。真的想手動重來一次仍然可以走
     # /redeploy，那支列的是全部的 app，不只有問題的那些。
     problems = [
-        i for i in visible_installs() if i.expired or i.overdue or i.failing_now
+        i
+        for i in visible_installs()
+        if not i.restart_cant_fix and (i.expired or i.overdue or i.failing_now)
     ]
     if not problems:
         return None
@@ -721,6 +738,119 @@ def perform_restart() -> tuple[bool, str]:
     return False, (
         f"已送出重啟指令，但 daemon 沒回到 running（state={daemon_state()}）"
     )
+
+
+# ---------------------------------------------------------------- usbmuxd
+
+# usbmuxd 弄丟、接上裝置時的日誌，見 config.USBMUXD_DROP_MINUTES 上方說明。裝置的
+# Bonjour 名稱長這樣：<Wi-Fi MAC>@<IPv6 link-local>-supportsRP-NN。
+_USBMUXD_DROP_RE = re.compile(
+    r"DNSServiceReconfirmRecord\((([0-9a-f:]{17})@[^)]*?)\._apple-mobdev2\._tcp\.local\.\) failed"
+)
+_USBMUXD_ATTACH_RE = re.compile(
+    r"_SendAttachNotification sending attach for device '([0-9a-f:]{17})@"
+)
+_USBMUXD_UDID_RE = re.compile(r'UniqueDeviceID = "([^"]+)";')
+_BONJOUR_HOST_RE = re.compile(r"can be reached at (.+?)\.local\.:\d+")
+
+
+def usbmuxd_log(since: datetime) -> list[tuple[str, str]]:
+    """usbmuxd 從 since 起弄丟、接上裝置的日誌，依時間排序，每筆是（時間, 訊息）。
+
+    讀不到就是空清單：這是輔助偵測，不能讓它弄壞 monitor 的主流程。
+    """
+    result = subprocess.run(
+        [
+            "/usr/bin/log", "show", "--style", "ndjson",
+            "--start", since.astimezone().strftime("%Y-%m-%d %H:%M:%S"),
+            "--predicate",
+            'process == "usbmuxd" AND (eventMessage CONTAINS "_SendAttachNotification"'
+            ' OR eventMessage CONTAINS "DNSServiceReconfirmRecord")',
+        ],
+        capture_output=True,
+        text=True,
+    )
+    events = []
+    for line in result.stdout.splitlines():
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        # 最後一行是 {"count": ..., "finished": 1} 這種摘要，不是事件。
+        if "eventMessage" in row and "timestamp" in row:
+            events.append((row["timestamp"], row["eventMessage"]))
+    return events
+
+
+def track_usbmuxd_drops(drops: dict[str, dict], events: list[tuple[str, str]]) -> dict[str, dict]:
+    """把 usbmuxd 的日誌依序套到上一輪的結果上，回傳現在還被弄丟的裝置。
+
+    key 是裝置的 Wi-Fi MAC，值是 {"instance": Bonjour 名稱, "dropped_at": 時間,
+    "udid": UDID，日誌裡沒看過它接上就是 None}，原樣存進 state.json。重新接上就拿掉。
+    每輪讀的範圍會跟上一輪重疊，同一段日誌套兩次結果一樣。
+    """
+    drops = dict(drops)
+    udids = {mac: drop["udid"] for mac, drop in drops.items()}
+    for timestamp, message in events:
+        if attach := _USBMUXD_ATTACH_RE.search(message):
+            mac = attach.group(1)
+            drops.pop(mac, None)
+            if udid := _USBMUXD_UDID_RE.search(message):
+                udids[mac] = udid.group(1)
+        # 這筆錯誤之後一定緊接著斷線（11-08～09 的 5 次都在同一毫秒內），不必另外比對斷線。
+        elif drop := _USBMUXD_DROP_RE.search(message):
+            instance, mac = drop.groups()
+            drops.setdefault(
+                mac, {"instance": instance, "dropped_at": timestamp, "udid": udids.get(mac)}
+            )
+    return drops
+
+
+def wifi_sync_host(instance: str) -> str | None:
+    """裝置現在還在 Wi-Fi 上的話，回傳它的 Bonjour 主機名稱（通常就是裝置名稱）。
+
+    靠 dns-sd -L 解析它的 Wi-Fi 同步服務。不能看瀏覽清單（-B）：裝置離開後那筆紀錄
+    還會在快取裡留到 75 分鐘（PTR 的 TTL），解析要的 SRV 紀錄則兩分鐘沒人回應就失效。
+    """
+    try:
+        output = subprocess.run(
+            ["dns-sd", "-L", instance, "_apple-mobdev2._tcp", "local"],
+            capture_output=True,
+            timeout=config.BONJOUR_RESOLVE_SECONDS,
+        ).stdout
+    except subprocess.TimeoutExpired as exc:
+        # dns-sd 自己不會結束，正常就是走到這裡；逾時前印出的東西在 exc.stdout。
+        output = exc.stdout
+    match = _BONJOUR_HOST_RE.search((output or b"").decode(errors="replace"))
+    return match.group(1) if match else None
+
+
+def _usbmuxd_pid() -> str | None:
+    result = subprocess.run(["pgrep", "-x", "usbmuxd"], capture_output=True, text=True)
+    return result.stdout.strip() or None
+
+
+def restart_usbmuxd() -> tuple[bool, str]:
+    """砍掉 usbmuxd，launchd 會立刻重開一個（它設了 KeepAlive），新的那個會重新找
+    一遍所有裝置。
+
+    usbmuxd 跑在系統帳號底下，要 root 才砍得掉：靠一條只放行這一行指令的 sudoers
+    規則（見 README）。-n 讓規則沒設好時直接失敗，而不是卡在等密碼。
+    """
+    before = _usbmuxd_pid()
+    result = subprocess.run(
+        ["sudo", "-n", "/usr/bin/killall", "usbmuxd"], capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        error = result.stderr.strip() or f"exit {result.returncode}"
+        return False, f"killall 失敗：{error}（sudoers 規則設好了嗎？見 README）"
+
+    for _ in range(config.RESTART_VERIFY_ATTEMPTS):
+        time.sleep(config.RESTART_VERIFY_INTERVAL_SECONDS)
+        after = _usbmuxd_pid()
+        if after and after != before:
+            return True, "已重啟 usbmuxd，裝置會在幾秒內重新接上"
+    return False, "已送出 killall，但沒看到 usbmuxd 重新起來"
 
 
 def rotate_log(path: Path) -> str | None:

@@ -31,6 +31,8 @@ KIND_LABELS = {
     "device_offline": "裝置離線",
     "device_online": "裝置回線",
     "restart": "重啟 daemon",
+    "usbmuxd_drop": "usbmuxd 弄丟裝置",
+    "usbmuxd_restart": "重啟 usbmuxd",
     "monitor_stale": "監控停擺",
 }
 

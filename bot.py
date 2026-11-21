@@ -32,6 +32,7 @@ BOT_COMMANDS = [
     {"command": "stats", "description": "刷新統計"},
     {"command": "restart", "description": "重啟 Sideloadly daemon"},
     {"command": "redeploy", "description": "為某個 app 重新部署（重啟 daemon）"},
+    {"command": "usbmuxd", "description": "重啟 usbmuxd（Mac 接不回 Wi-Fi 上的裝置時）"},
     {"command": "forget", "description": "忘記某個裝置或 app"},
     {"command": "forgotten", "description": "查看/復原忘記清單"},
     {"command": "mute", "description": f"暫停通知（預設 {DEFAULT_MUTE_HOURS} 小時）"},
@@ -61,6 +62,7 @@ MENU_KEYBOARD = {
             {"text": "🔄 重啟 daemon", "callback_data": "restart"},
             {"text": "🔁 重新部署", "callback_data": "redeploy"},
         ],
+        [{"text": "🔌 重啟 usbmuxd", "callback_data": "usbmuxd"}],
     ]
 }
 
@@ -92,6 +94,8 @@ HELP_TEXT = (
     "/restart - 重啟 daemon（需確認）\n"
     "/redeploy - 為某個 app 重新部署（需確認；動作跟 /restart 一樣是整顆"
     "daemon 重啟，只是訊息和紀錄會點名是為了哪個 app）\n"
+    "/usbmuxd - 重啟 usbmuxd（需確認）。裝置明明在 Wi-Fi 上 Sideloadly 卻看不到時用，"
+    "monitor 偵測到會主動附上這顆按鈕\n"
     "/forget - 忘記某個裝置或 app，之後不再收到它的告警（只是本機清單，"
     "不會動到 Sideloadly 自己的資料）\n"
     "/forgotten - 查看已忘記清單，可以復原\n"
@@ -101,8 +105,9 @@ HELP_TEXT = (
     "靜音只擋主動通知，指令回覆照常，事件仍會記錄。"
 )
 
-# {"until": datetime, "reason": str | None} — reason 是 /redeploy 點名的 app，
-# 一般 /restart 沒有 reason。兩者共用同一段確認流程與同一個 restart:go 按鈕。
+# {"until": datetime, "reason": str | None, "target": "daemon" | "usbmuxd"} —
+# reason 是 /redeploy 點名的 app，一般 /restart 沒有 reason。/restart、/redeploy、
+# /usbmuxd 共用同一段確認流程與同一個 restart:go 按鈕，target 決定重啟的是誰。
 _pending_restart: dict | None = None
 _heartbeat_alerted_at: datetime | None = None
 _heartbeat_was_stale = False
@@ -125,15 +130,22 @@ def _picker_keyboard(action: str, buttons: list[tuple[str, str]]) -> dict:
     return {"inline_keyboard": [*rows, BACK_TO_MENU_KEYBOARD_ROW]}
 
 
-def _start_restart_confirm(reason: str | None):
-    """/restart 與 /redeploy 共用的確認流程，差別只在訊息措辭跟事後紀錄要不要
-    點名是哪個 app——實際動作兩邊完全一樣，都是整顆 daemon 重啟。"""
+def _start_restart_confirm(reason: str | None, target: str = "daemon"):
+    """/restart、/redeploy、/usbmuxd 共用的確認流程。/restart 與 /redeploy 的差別只在
+    訊息措辭跟事後紀錄要不要點名是哪個 app——實際動作都是整顆 daemon 重啟。"""
     global _pending_restart
     _pending_restart = {
         "until": datetime.now(timezone.utc) + timedelta(seconds=CONFIRM_SECONDS),
         "reason": reason,
+        "target": target,
     }
-    if reason:
+    if target == "usbmuxd":
+        text = (
+            "⚠ 確定要重啟 usbmuxd？\n"
+            "Mac 跟所有 iPhone/iPad 的連線都會斷幾秒再自己接回來，剛好在安裝的 app "
+            f"會被打斷。{CONFIRM_SECONDS} 秒內確認，或直接忽略。"
+        )
+    elif reason:
         text = (
             f"⚠ 確定要為了「{reason}」重新部署？\n"
             "這個動作是重啟整顆 Sideloadly daemon（目前沒有辦法只重簽單一 app），"
@@ -197,11 +209,18 @@ def dispatch(action: str, args: list[str]):
                 "沒有待確認的重啟（已逾時或已取消），請重新操作。", reply_markup=MENU_KEYBOARD
             )
             return
-        reason = _pending_restart.get("reason")
+        pending = _pending_restart
         _pending_restart = None
         common.send_message("正在重啟，稍候…")
-        ok, result = common.perform_restart()
-        history.record_restart(ok, result, f"telegram，為了 {reason}" if reason else "telegram")
+        if pending["target"] == "usbmuxd":
+            ok, result = common.restart_usbmuxd()
+            history.record("usbmuxd_restart", detail=f"{'ok' if ok else 'fail'}: {result}")
+        else:
+            ok, result = common.perform_restart()
+            reason = pending["reason"]
+            history.record_restart(
+                ok, result, f"telegram，為了 {reason}" if reason else "telegram"
+            )
         common.send_message(
             ("✅ " if ok else "❌ ") + result, reply_markup=MENU_KEYBOARD
         )
@@ -213,6 +232,9 @@ def dispatch(action: str, args: list[str]):
 
     elif action == "restart":
         _start_restart_confirm(None)
+
+    elif action == "usbmuxd":
+        _start_restart_confirm(None, target="usbmuxd")
 
     elif action == "redeploy":
         target = args[0] if args else None

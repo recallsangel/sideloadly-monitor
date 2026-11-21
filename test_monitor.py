@@ -66,6 +66,12 @@ common.api = fake_api
 common.daemon_state = lambda: "running"
 common.daemon_footprint = lambda: 100 * 1024**2
 common.perform_restart = lambda: (True, "已重啟（測試）")
+# monitor.main() 每輪也會讀 usbmuxd 的系統日誌、用 dns-sd 問裝置在不在 Wi-Fi 上。不換掉
+# 的話，這台機器當下剛好有裝置被弄丟時，後面每一段「不推送」的檢查都會失敗。
+USBMUXD_EVENTS: list[tuple[str, str]] = []
+common.usbmuxd_log = lambda since: list(USBMUXD_EVENTS)
+common.wifi_sync_host = lambda instance: None
+common.restart_usbmuxd = lambda: (True, "已重啟 usbmuxd（測試）")
 
 
 def sent_text() -> str:
@@ -528,6 +534,40 @@ check("只有舊帳時 /status 不給重新部署按鈕", common.status_action_k
 fail_row(ts(minutes=-30))
 check("失敗還在發生時 /status 給得出按鈕", common.status_action_keyboard() is not None)
 
+# 2026-11-09 04:00 為「Anisette failed: No OTP」重啟了一次：毛病在 anisette，而且
+# 那些 app 早就失敗滿 3 次、被 daemon 放棄了，重啟兩件都救不回來。
+
+
+def cant_fix_row(error, failures, updated=None):
+    db("UPDATE installations SET last_error = ?, failures_count = ?, "
+       "last_failure_at = ?, last_updated = ? WHERE id = ?",
+       error, failures, ts(minutes=-30), updated or ts(hours=-2), id2)
+    reasons, stale = restart.restart_reasons()
+    return "\n".join(reasons), "\n".join(stale)
+
+
+reasons, stale = cant_fix_row(SENTINEL, config.SIDELOADLY_GIVE_UP_FAILURES)
+check("daemon 已放棄的 app 不算重啟理由", SENTINEL not in reasons and SENTINEL in stale)
+check("已放棄的 app 不再說等下次刷新", "已停止重試" in stale and "等下次刷新" not in stale)
+check("已放棄的 app 不給重新部署按鈕", common.status_action_keyboard() is None)
+
+reasons, stale = cant_fix_row(SENTINEL, config.SIDELOADLY_GIVE_UP_FAILURES - 1)
+check("還沒到放棄門檻的剛發生失敗照樣算重啟理由", SENTINEL in reasons)
+
+ANISETTE_ERROR = f"Install failed: {SENTINEL} Anisette failed: No OTP"
+reasons, stale = cant_fix_row(ANISETTE_ERROR, 1)
+check("anisette 失敗不算重啟理由", SENTINEL not in reasons and SENTINEL in stale)
+
+# 已放棄的 app 會一路逾期到過期，那也是同一個毛病，不能換個名目觸發重啟。
+reasons, _ = cant_fix_row(SENTINEL, config.SIDELOADLY_GIVE_UP_FAILURES,
+                          updated=ts(days=-8))
+check("已放棄的 app 過期也不算重啟理由", not reasons)
+
+restarted.clear()
+cant_fix_row(ANISETTE_ERROR, config.SIDELOADLY_GIVE_UP_FAILURES)
+restart.main()
+check("只有重啟解不掉的失敗時 main() 不重啟", not restarted)
+
 # 錯誤「變舊」不是「解除」：monitor 讀的必須是原始旗標，否則時效一到就會憑空
 # 推一則「錯誤已解除」，而那時候什麼都還沒解決。
 run("fresh failure")
@@ -595,6 +635,136 @@ restarted.clear()
 common.daemon_state = lambda: "running"
 run("daemon running")
 check("daemon 在跑時 monitor 不重啟", not restarted)
+
+# ------------------------------------------- usbmuxd 弄丟還在 Wi-Fi 上的裝置
+
+# 2026-11-09 23:22 Joy 被 usbmuxd 弄丟，它一直待在 Wi-Fi 上，所以一直沒被接回來，
+# 到期前的那次刷新跟著失敗。下面的日誌照抄當時的格式，只換掉 MAC 與 UDID。
+LOST_MAC = "aa:bb:cc:00:00:01"
+LOST_INSTANCE = f"{LOST_MAC}@fe80::a8bb:ccff:fe00:1-supportsRP-26"
+LOST_HOST = "測試主機xyzzy"
+LOST_HEADING = "Mac 弄丟了 Wi-Fi 上的裝置"
+lost_device = common.visible_devices()[0]
+
+
+def usbmuxd_ts(**kw):
+    """log show 的時間格式：本機時間，時區寫成 +0800。"""
+    return (datetime.now() + timedelta(**kw)).astimezone().strftime("%Y-%m-%d %H:%M:%S.%f%z")
+
+
+def attach_event(mac, udid, **kw):
+    return (
+        usbmuxd_ts(**kw),
+        f"_SendAttachNotification sending attach for device "
+        f"'{mac}@fe80::1-supportsRP-26._apple-mobdev2._tcp.local.': {{\n"
+        f"    AttachedInterfaceIndex = 15;\n    PortNumber = 32498;\n"
+        f'    UniqueDeviceID = "{udid}";\n    WiFiMACAddress = "{mac}";\n'
+        f"}} (_GetAddrInfoReplyReceivedCallback matched).",
+    )
+
+
+def drop_event(**kw):
+    return (
+        usbmuxd_ts(**kw),
+        f"USBMuxBonjourDeviceReconfirm DNSServiceReconfirmRecord("
+        f"{LOST_INSTANCE}._apple-mobdev2._tcp.local.) failed -65541.",
+    )
+
+
+def reset_usbmuxd_state():
+    state = json.loads(config.STATE_PATH.read_text())
+    state["usbmuxd_drops"], state["usbmuxd_notified"] = {}, {}
+    config.STATE_PATH.write_text(json.dumps(state))
+
+
+lost_log = [attach_event(LOST_MAC, lost_device.udid, minutes=-41), drop_event(minutes=-40)]
+drops = common.track_usbmuxd_drops({}, lost_log)
+check("確認失敗就算弄丟", LOST_MAC in drops)
+check("記下它的 Bonjour 名稱（之後拿來問它還在不在）",
+      drops.get(LOST_MAC, {}).get("instance") == LOST_INSTANCE)
+check("記下之前接上時看到的 UDID", drops.get(LOST_MAC, {}).get("udid") == lost_device.udid)
+check("沒有新日誌時沿用上一輪的結果", common.track_usbmuxd_drops(drops, []) == drops)
+check("同一段日誌讀兩次結果一樣", common.track_usbmuxd_drops(drops, lost_log) == drops)
+check("別台裝置接上不影響",
+      LOST_MAC in common.track_usbmuxd_drops(drops, [attach_event("aa:bb:cc:00:00:02", "x")]))
+check("重新接上就不算弄丟",
+      not common.track_usbmuxd_drops(drops, [attach_event(LOST_MAC, lost_device.udid)]))
+check("dns-sd -L 的輸出解析得出主機名稱",
+      common._BONJOUR_HOST_RE.search(
+          f"23:50:47.104  {LOST_INSTANCE}._apple-mobdev2._tcp.local. "
+          "can be reached at Joy.local.:32498 (interface 15)"
+      ).group(1) == "Joy")
+
+reset_usbmuxd_state()
+USBMUXD_EVENTS[:] = lost_log
+common.wifi_sync_host = lambda instance: LOST_HOST if instance == LOST_INSTANCE else None
+body = run("usbmuxd lost a device")
+check("弄丟超過門檻、還在 Wi-Fi 上就告警", LOST_HEADING in body)
+check("告警點名是哪台裝置", lost_device.name in body)
+check("告警附上重啟 usbmuxd 的按鈕", find_callback("usbmuxd") == "usbmuxd")
+
+USBMUXD_EVENTS.clear()
+check("同一天不重複提醒", LOST_HEADING not in run("usbmuxd same day"))
+check("弄丟的紀錄存進 state.json，下一輪沒有新日誌也記得",
+      LOST_MAC in json.loads(config.STATE_PATH.read_text())["usbmuxd_drops"])
+
+state = json.loads(config.STATE_PATH.read_text())
+state["usbmuxd_notified"][LOST_MAC] = "2000-01-01"
+config.STATE_PATH.write_text(json.dumps(state))
+check("隔天還沒接回來就再提醒", LOST_HEADING in run("usbmuxd next day"))
+
+reset_usbmuxd_state()
+USBMUXD_EVENTS[:] = lost_log
+common.wifi_sync_host = lambda instance: None
+check("裝置不在 Wi-Fi 上就不告警（重啟 usbmuxd 也接不回來）",
+      LOST_HEADING not in run("usbmuxd device away"))
+common.wifi_sync_host = lambda instance: LOST_HOST if instance == LOST_INSTANCE else None
+
+reset_usbmuxd_state()
+USBMUXD_EVENTS[:] = [drop_event(minutes=-(config.USBMUXD_DROP_MINUTES - 5))]
+check("剛弄丟、還沒到門檻不告警", LOST_HEADING not in run("usbmuxd just dropped"))
+
+reset_usbmuxd_state()
+USBMUXD_EVENTS[:] = lost_log
+forget.forget_device(lost_device.udid, lost_device.name)
+check("忘記的裝置不告警", LOST_HEADING not in run("usbmuxd forgotten device"))
+forget.unforget_device(lost_device.udid)
+
+reset_usbmuxd_state()
+USBMUXD_EVENTS[:] = [drop_event(minutes=-40)]
+body = run("usbmuxd unknown device")
+check("日誌裡認不出是哪台時，用 Bonjour 主機名稱點名", LOST_HEADING in body and LOST_HOST in body)
+
+USBMUXD_EVENTS[:] = [attach_event(LOST_MAC, lost_device.udid, minutes=-1)]
+run("usbmuxd reattached")
+check("重新接上就從 state.json 拿掉",
+      LOST_MAC not in json.loads(config.STATE_PATH.read_text())["usbmuxd_drops"])
+
+USBMUXD_EVENTS.clear()
+common.wifi_sync_host = lambda instance: None
+
+# 按鈕和指令走跟 /restart 同一段確認流程，但確認後重啟的必須是 usbmuxd，不是 daemon。
+usbmuxd_restarted = []
+common.restart_usbmuxd = lambda: (
+    usbmuxd_restarted.append(1) or (True, "已重啟 usbmuxd（測試）")
+)
+restarted.clear()
+press("usbmuxd")
+check("usbmuxd 按鈕先要求確認", "確定要重啟 usbmuxd" in sent_text() and not usbmuxd_restarted)
+press("restart:go")
+check("確認後重啟的是 usbmuxd，不是 daemon", usbmuxd_restarted and not restarted)
+check("重啟 usbmuxd 記進歷史", history.recent(1, kinds=["usbmuxd_restart"]))
+
+usbmuxd_restarted.clear()
+say("/usbmuxd")
+say("/confirm")
+check("/usbmuxd 文字指令也能確認", usbmuxd_restarted)
+
+usbmuxd_restarted.clear()
+press("restart")
+press("restart:go")
+check("之後的 /restart 照樣重啟 daemon", restarted and not usbmuxd_restarted)
+check("指令清單有 usbmuxd", "usbmuxd" in {c["command"] for c in bot.BOT_COMMANDS})
 
 # ------------------------------------------- 沒有任何 app 時照樣要推送
 

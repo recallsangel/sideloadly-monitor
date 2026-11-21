@@ -66,6 +66,16 @@
 （`Cancelled（1 次，2.3 天前，等下次刷新才會清）`），不會給重新部署按鈕——
 真的想手動重來一次仍然可以走 `/redeploy`，那支列的是全部的 app。
 
+另外有兩種失敗**重啟根本救不回來**（`Install.restart_cant_fix`），連「剛發生」都不算
+重啟理由，也不給重新部署按鈕：
+
+- `failures_count` 到 `SIDELOADLY_GIVE_UP_FAILURES`（3）：daemon 從此每次 tick 都印
+  `This app is in Failed state, ignoring`，不再重試。計數存在資料庫裡，重啟不會歸零。
+- `last_error` 含 `RESTART_CANT_FIX_ERRORS`（目前是 `Anisette failed`）：毛病在 Apple
+  登入要的 anisette 資料，不在 daemon。2026-11-09 04:00 為 `Anisette failed: No OTP`
+  重啟過一次，什麼都沒解決——根因是 macOS 27 擋掉 Local Anisette，要到 Sideloadly
+  設定換 anisette 模式。
+
 ## daemon 記憶體洩漏
 
 Sideloadly daemon 會漏記憶體：2026-09-19 啟動後連跑 20 天，到 10-09 footprint
@@ -92,6 +102,45 @@ daemon 不會打斷任何刷新，跟「不要無條件重啟」不衝突；記�
 服務根本沒載入（`launchctl print` 查不到它）時 monitor 不動手：那通常是刻意卸載的，
 硬要重啟只會每小時推一次失敗。
 
+## usbmuxd 弄丟還在 Wi-Fi 上的裝置
+
+Sideloadly 透過 macOS 的 usbmuxd（管 iPhone/iPad 連線的系統服務）找裝置。usbmuxd
+偶爾會把一台還在 Wi-Fi 上的裝置弄丟：確認它的 Bonjour 紀錄時出錯，日誌是
+
+```
+USBMuxBonjourDeviceReconfirm DNSServiceReconfirmRecord(<MAC>@<IPv6>-supportsRP-26._apple-mobdev2._tcp.local.) failed -65541.
+```
+
+緊接著斷線。之後只有那台裝置「重新出現」在 Bonjour 上（關掉再打開 Wi-Fi、離開
+再回來）才會被接回來——一直待在 Wi-Fi 上的手機不會重新出現，所以一直接不回來，
+Sideloadly 也就一直看不到它。重開 Sideloadly 沒用，弄丟它的不是 Sideloadly。
+
+2026-11-09 23:22 Joy 就是這樣：螢幕亮著、連著 Wi-Fi，卻連續半小時沒被接回來，到期前
+的那次刷新跟著失敗；`sudo killall usbmuxd`（launchd 會立刻重開一個，新的那個會重新
+找一遍所有裝置）之後立刻接回。同一種錯誤 11-08～09 出現 5 次，另外 4 次都自己接
+回來了，所以 `monitor.py` 不是一看到就告警：
+
+1. 每輪讀上一輪之後的 usbmuxd 日誌（`log show`），記下弄丟、拿掉重新接上的，
+   結果存在 `state.json` 一路帶著。
+2. 弄丟超過 `USBMUXD_DROP_MINUTES`（30 分鐘）還沒接回來，用 `dns-sd -L` 問它還在
+   不在 Wi-Fi 上——真的離開 Wi-Fi 也會留下同一筆錯誤，那種重啟 usbmuxd 也接不回來。
+   不看瀏覽清單（`dns-sd -B`）：裝置走了之後那筆紀錄還會在快取裡留到 75 分鐘。
+3. 還在，就告警（每天最多一次）並附一顆「重啟 usbmuxd」按鈕，按了一樣要二次確認：
+   所有裝置都會斷線幾秒，剛好在安裝的 app 會被打斷。
+
+忘記（`/forget`）的裝置、不是 Sideloadly 在用的裝置不告警。
+
+usbmuxd 跑在系統帳號底下，砍它要 root。bot 用 `sudo -n` 跑這一行，所以要先給一條
+**只放行這一行指令**的 sudoers 規則（先用 `visudo -c` 檢查格式，正確才裝進去，打錯
+也不會把 sudo 弄壞）：
+
+```sh
+echo "$(whoami) ALL=(root) NOPASSWD: /usr/bin/killall usbmuxd" > /tmp/usbmuxd.sudoers
+sudo visudo -cf /tmp/usbmuxd.sudoers && sudo install -m 440 -o root -g wheel /tmp/usbmuxd.sudoers /etc/sudoers.d/usbmuxd
+```
+
+沒設的話按鈕會回「killall 失敗」，其他功能不受影響。
+
 ## 告警項目
 
 | 事件 | 觸發條件 |
@@ -103,6 +152,7 @@ daemon 不會打斷任何刷新，跟「不要無條件重啟」不衝突；記�
 | 已過期 | 超過 `known_ttl`（每天最多提醒一次） |
 | 裝置離線 | `devices.last_seen` 超過 `DEVICE_OFFLINE_HOURS` |
 | 裝置回線 | 離線後又出現 |
+| usbmuxd 弄丟裝置 | 弄丟超過 `USBMUXD_DROP_MINUTES` 而且裝置還在 Wi-Fi 上（每天最多提醒一次，附重啟 usbmuxd 按鈕） |
 | 監控停擺 | `state.json` 的 `last_run` 超過 `HEARTBEAT_STALE_HOURS` 沒更新 |
 | daemon 重啟 | daemon 已載入但沒在跑（monitor 當場重啟，另發一則通知），或 04:00 `restart.py` 有理由重啟 |
 
@@ -129,6 +179,7 @@ daemon 不會打斷任何刷新，跟「不要無條件重啟」不衝突；記�
 /stats [天數]   刷新/失敗次數與平均間隔（預設 7 天）
 /restart        重啟 daemon（需確認）
 /redeploy       為某個 app 重新部署（需確認；動作跟 /restart 一樣）
+/usbmuxd        重啟 usbmuxd（需確認；見「usbmuxd 弄丟還在 Wi-Fi 上的裝置」）
 /forget         忘記某個裝置或 app，之後不再告警
 /forgotten      查看忘記清單，可以復原
 /mute [小時]    暫停主動通知（預設 8 小時）
@@ -138,7 +189,7 @@ daemon 不會打斷任何刷新，跟「不要無條件重啟」不衝突；記�
 
 按鈕和文字指令走同一套 `dispatch()`，行為一致。重啟一定要二次確認——
 按鈕會跳出「確定重啟 / 取消」，文字指令則是 60 秒內回 `/confirm`。`/redeploy`
-共用同一段確認流程。
+和 `/usbmuxd` 共用同一段確認流程。
 
 靜音只擋主動推送，指令回覆照常。靜音期間的事件**仍會寫進歷史**，解除後用
 `/log` 補看。
@@ -293,6 +344,8 @@ cd sideloadly-monitor
    ```
 
 4. 傳 `/status` 給 bot 確認有回應。
+5. （選用）要讓「重啟 usbmuxd」按鈕能用，加一條 sudoers 規則，見上方「usbmuxd 弄丟
+   還在 Wi-Fi 上的裝置」。
 
 `restart.py` 預設用 `launchctl kickstart` 重啟 label 為 `io.sideloadly.daemon` 的
 Sideloadly daemon（`config.py` 的 `DAEMON_LABEL`），如果你的環境 label 不同要一併改。
@@ -353,7 +406,7 @@ tick 骨架。**卡點的樣子是某個 `Will tick` 後面沒有對應的 `Done
 
 ## 產生的檔案（都不進版控）
 
-- `state.json` — 上輪快照 + `last_run` 心跳
+- `state.json` — 上輪快照 + `last_run` 心跳 + usbmuxd 弄丟的裝置
 - `events.db` — 事件歷史，`/log` 和 `/stats` 的來源
 - `mute_until.txt` — 靜音到期時間，存在才算靜音
 - `bot_offset.txt` — Telegram update offset
